@@ -5,11 +5,16 @@ import { readFileSync } from "node:fs";
 import { ControlPlaneOrchestrator } from "./orchestrator.mjs";
 import { createControlPlaneServer } from "./server.mjs";
 import { ControlPlaneStore } from "./store.mjs";
+import { CcSwitchProviderResolver } from "./ccswitch.mjs";
 
 function option(name,fallback) { const index=process.argv.indexOf(name);return index>=0?process.argv[index+1]:fallback; }
 const command=process.argv[2]??"serve";
 const stateRoot=resolve(option("--state",process.env.CROSS_AGENT_STATE_DIR??join(homedir(),".openhands","agent-canvas","control-plane")));
-const store=new ControlPlaneStore(stateRoot),orchestrator=new ControlPlaneOrchestrator({store,worktreesRoot:join(stateRoot,"worktrees")});
+const store=new ControlPlaneStore(stateRoot),orchestrator=new ControlPlaneOrchestrator({
+  store,
+  worktreesRoot:join(stateRoot,"worktrees"),
+  providerResolver:new CcSwitchProviderResolver({runtimeConfigRoot:join(stateRoot,"runtime-configs")}),
+});
 
 try {
   if(command==="serve") {

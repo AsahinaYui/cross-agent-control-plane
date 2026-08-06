@@ -1,11 +1,9 @@
-/* eslint-disable i18next/no-literal-string */
 import React from "react";
 import { useTranslation } from "react-i18next";
 import {
   ChevronLeft,
   ChevronRight,
   Plus,
-  Network,
   Server,
   Settings,
 } from "lucide-react";
@@ -203,13 +201,6 @@ export function SidebarRailBody({
               <path d="M12 13.5V8" />
             </svg>
           }
-        />
-        <SidebarNavLink
-          to="/control-plane"
-          label="Control Plane"
-          testId="sidebar-control-plane-link"
-          collapsed={collapsed}
-          icon={<Network width={ICON_SIZE} height={ICON_SIZE} />}
         />
         <SidebarNavLink
           to={automationListPath()}

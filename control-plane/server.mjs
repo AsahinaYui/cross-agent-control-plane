@@ -1,6 +1,8 @@
 import { createReadStream } from "node:fs";
 import { createServer } from "node:http";
 import { URL } from "node:url";
+import { quickStart } from "./quick-start.mjs";
+import { readCcSwitchCatalog } from "./ccswitch.mjs";
 
 const json = (res, status, value) => {
   const body = JSON.stringify(value);
@@ -18,7 +20,12 @@ async function body(req) {
     : {};
 }
 
-export function createControlPlaneServer({ store, orchestrator, apiKey }) {
+export function createControlPlaneServer({
+  store,
+  orchestrator,
+  apiKey,
+  providerCatalog = () => readCcSwitchCatalog(),
+}) {
   return createServer(async (req, res) => {
     try {
       if (apiKey && req.headers["x-session-api-key"] !== apiKey)
@@ -33,8 +40,28 @@ export function createControlPlaneServer({ store, orchestrator, apiKey }) {
           status: "ok",
           schema: "cross-agent/control-plane/v1",
         });
+      if (
+        req.method === "GET" &&
+        parts[1] === "ccswitch" &&
+        parts[2] === "providers" &&
+        parts.length === 3
+      )
+        return json(res, 200, {
+          source: "ccswitch",
+          items: providerCatalog(),
+        });
       if (req.method === "GET" && parts[1] === "tasks" && parts.length === 2)
         return json(res, 200, { items: store.listTasks() });
+      if (
+        req.method === "POST" &&
+        parts[1] === "quick-start" &&
+        parts.length === 2
+      )
+        return json(
+          res,
+          202,
+          await quickStart({ store, orchestrator, input: await body(req) }),
+        );
       if (req.method === "POST" && parts[1] === "tasks" && parts.length === 2)
         return json(res, 201, store.createTask(await body(req)));
       if (req.method === "GET" && parts[1] === "tasks" && parts.length === 3) {
@@ -42,6 +69,161 @@ export function createControlPlaneServer({ store, orchestrator, apiKey }) {
         return task
           ? json(res, 200, task)
           : json(res, 404, { error: "task_not_found" });
+      }
+      if (
+        req.method === "GET" &&
+        parts[1] === "tasks" &&
+        parts[3] === "execution-plan"
+      ) {
+        const plan = store.getExecutionPlan(
+          parts[2],
+          url.searchParams.get("revision")
+            ? Number(url.searchParams.get("revision"))
+            : undefined,
+        );
+        return plan
+          ? json(res, 200, plan)
+          : json(res, 404, { error: "execution_plan_not_found" });
+      }
+      if (
+        req.method === "POST" &&
+        parts[1] === "tasks" &&
+        parts[3] === "execution-plan"
+      )
+        return json(
+          res,
+          201,
+          store.createExecutionPlan(parts[2], await body(req)),
+        );
+      if (
+        req.method === "GET" &&
+        parts[1] === "tasks" &&
+        parts[3] === "sessions" &&
+        parts.length === 4
+      )
+        return json(res, 200, { items: store.listSessions(parts[2]) });
+      if (
+        req.method === "POST" &&
+        parts[1] === "tasks" &&
+        parts[3] === "sessions" &&
+        parts.length === 4
+      )
+        return json(res, 201, store.attachSession(parts[2], await body(req)));
+      if (
+        req.method === "POST" &&
+        parts[1] === "tasks" &&
+        parts[3] === "sessions" &&
+        parts[4] &&
+        parts[5] === "heartbeat"
+      )
+        return json(res, 200, store.heartbeatSession(parts[4]));
+      if (
+        req.method === "POST" &&
+        parts[1] === "tasks" &&
+        parts[3] === "sessions" &&
+        parts[4] &&
+        parts[5] === "close"
+      )
+        return json(res, 200, store.closeSession(parts[4]));
+      if (
+        req.method === "GET" &&
+        parts[1] === "tasks" &&
+        parts[3] === "assignments" &&
+        parts.length === 4
+      )
+        return json(res, 200, { items: store.listAssignments(parts[2]) });
+      if (
+        req.method === "POST" &&
+        parts[1] === "tasks" &&
+        parts[3] === "assignments" &&
+        parts.length === 4
+      )
+        return json(
+          res,
+          201,
+          store.createAssignment(parts[2], await body(req)),
+        );
+      if (
+        req.method === "POST" &&
+        parts[1] === "tasks" &&
+        parts[3] === "assignments" &&
+        parts[4] &&
+        parts[5] === "assign"
+      ) {
+        const input = await body(req);
+        return json(res, 200, store.assignSession(parts[4], input.session_id));
+      }
+      if (
+        req.method === "POST" &&
+        parts[1] === "tasks" &&
+        parts[3] === "assignments" &&
+        parts[4] &&
+        parts[5] === "runs"
+      ) {
+        const input = await body(req),
+          started = await orchestrator.startAssignment({
+            assignmentId: parts[4],
+            coordinatorSessionId: input.coordinator_session_id,
+            repositoryRoot: input.repository_root,
+            runtimeOptions: input.runtime_options,
+            executable: input.executable,
+          });
+        started.completion.catch(() => {});
+        return json(res, 202, {
+          run: started.run,
+          assignment: started.assignment,
+        });
+      }
+      if (
+        req.method === "POST" &&
+        parts[1] === "tasks" &&
+        parts[3] === "leases" &&
+        parts[4] &&
+        parts[5] === "acquire"
+      ) {
+        const input = await body(req);
+        return json(
+          res,
+          200,
+          store.acquireLease(parts[2], parts[4], input.session_id, input),
+        );
+      }
+      if (
+        req.method === "POST" &&
+        parts[1] === "tasks" &&
+        parts[3] === "leases" &&
+        parts[4] &&
+        parts[5] === "release"
+      ) {
+        const input = await body(req);
+        return json(
+          res,
+          200,
+          store.releaseLease(parts[2], parts[4], input.session_id),
+        );
+      }
+      if (
+        req.method === "GET" &&
+        parts[1] === "tasks" &&
+        parts[3] === "activity"
+      )
+        return json(
+          res,
+          200,
+          store.getTaskActivity(
+            parts[2],
+            Math.min(Number(url.searchParams.get("event_limit")) || 100, 500),
+          ),
+        );
+      if (
+        req.method === "GET" &&
+        parts[1] === "tasks" &&
+        parts[3] === "workspace"
+      ) {
+        const workspace = store.getMissionWorkspace(parts[2]);
+        return workspace
+          ? json(res, 200, workspace)
+          : json(res, 404, { error: "mission_workspace_not_found" });
       }
       if (
         req.method === "GET" &&

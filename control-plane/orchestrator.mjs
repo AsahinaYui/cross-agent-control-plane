@@ -1,8 +1,8 @@
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { makeId, nowIso } from "./protocol.mjs";
 import { writeLease } from "./process.mjs";
 import { createRuntimeAdapter } from "./runtime-adapters.mjs";
-import { captureGitEvidence, createIsolatedWorktree } from "./worktree.mjs";
+import { captureGitEvidence, createMissionWorktree } from "./worktree.mjs";
 import { runVerificationMatrix } from "./verification.mjs";
 import { evaluateScope } from "./scope.mjs";
 
@@ -11,11 +11,14 @@ export class ControlPlaneOrchestrator {
     store,
     worktreesRoot,
     runtimeAdapterFactory = createRuntimeAdapter,
+    providerResolver = null,
   }) {
     this.store = store;
     this.worktreesRoot = worktreesRoot;
     this.runtimeAdapterFactory = runtimeAdapterFactory;
+    this.providerResolver = providerResolver;
     this.active = new Map();
+    this.workspacePreparing = new Map();
   }
   async startTask({
     taskId,
@@ -61,12 +64,7 @@ export class ControlPlaneOrchestrator {
         );
     if (resumeSessionId && !descriptor.capabilities.resume_session)
       throw new Error(`${runtimeId} does not support resume_session`);
-    const worktree = await createIsolatedWorktree({
-      repositoryRoot,
-      baseCommit: task.source.base_commit,
-      worktreesRoot: this.worktreesRoot,
-      runId,
-    });
+    const worktree = await this.#ensureMissionWorkspace(task, repositoryRoot);
     const run = this.store.createRun({
       run_id: runId,
       task_id: taskId,
@@ -111,6 +109,159 @@ export class ControlPlaneOrchestrator {
     void completion.finally(() => this.active.delete(runId)).catch(() => {});
     return { run: this.store.getRun(runId), completion };
   }
+  async startAssignment({
+    assignmentId,
+    coordinatorSessionId,
+    repositoryRoot,
+    runtimeOptions,
+    executable,
+  }) {
+    const assignment = this.store.getAssignment(assignmentId);
+    if (!assignment) throw new Error(`Unknown Assignment: ${assignmentId}`);
+    if (assignment.state !== "assigned")
+      throw new Error(
+        `Assignment must be assigned, observed ${assignment.state}`,
+      );
+    const task = this.store.getTask(
+        assignment.task_id,
+        assignment.task_revision,
+      ),
+      session = this.store.getSession(assignment.session_id);
+    if (!task || !session)
+      throw new Error("Assignment task or AgentSession is missing");
+    this.store.requireLease(task.task_id, "coordinator", coordinatorSessionId);
+    const adapter = this.runtimeAdapterFactory(assignment.profile.runtime_id),
+      descriptor = await adapter.describe();
+    for (const capability of task.execution.required_capabilities)
+      if (!descriptor.capabilities[capability])
+        throw new Error(
+          `${assignment.profile.runtime_id} lacks required capability: ${capability}`,
+        );
+    const worktree = await this.#ensureMissionWorkspace(task, repositoryRoot);
+    let writeLease = null,
+      runId = null;
+    if (assignment.write_intent)
+      writeLease = this.store.acquireLease(
+        task.task_id,
+        "workspace_write",
+        session.session_id,
+        { assignment_id: assignmentId, ttl_seconds: 86400 },
+      );
+    try {
+      runId = makeId("run");
+      const providerLaunch = this.providerResolver
+          ? this.providerResolver.resolve(assignment.profile, { runId })
+          : { env: {}, route: null },
+        run = this.store.createRun({
+          run_id: runId,
+          task_id: task.task_id,
+          task_revision: task.revision,
+          role: assignment.role,
+          runtime_id: assignment.profile.runtime_id,
+          adapter_version: descriptor.adapter_version,
+          repository_root: repositoryRoot,
+          ...worktree,
+          requested_model: assignment.profile.model_id,
+          expected_model: assignment.profile.model_id,
+          execution_profile: assignment.profile,
+          provider_route: providerLaunch.route,
+          runtime_capabilities: descriptor.capabilities,
+          assigned_actor: { kind: "session", id: session.session_id },
+          assignment_id: assignmentId,
+        });
+      this.store.bindAssignmentRun(assignmentId, runId);
+      this.store.transitionRun(runId, "preparing");
+      this.store.transitionAssignment(assignmentId, "running");
+      if (task.state === "draft")
+        this.store.transitionTask(task.task_id, task.revision, "ready");
+      const currentTask = this.store.getTask(task.task_id, task.revision);
+      if (["ready", "blocked", "changes_requested"].includes(currentTask.state))
+        this.store.transitionTask(task.task_id, task.revision, "running");
+      const active = {
+        adapter,
+        completion: null,
+        handle: null,
+        cancelRequested: false,
+      };
+      this.active.set(runId, active);
+      const completion = this.#execute({
+        runId,
+        task,
+        adapter,
+        worktree,
+        prompt: assignment.prompt,
+        runtimeOptions,
+        requestedModel: assignment.profile.model_id,
+        executable,
+        expectedModel: assignment.profile.model_id,
+        assignmentId,
+        actor: { role: assignment.role, id: session.session_id },
+        missionMode: true,
+        runtimeEnv: providerLaunch.env,
+      });
+      active.completion = completion;
+      void completion
+        .finally(() => {
+          this.active.delete(runId);
+          this.providerResolver?.cleanup?.(runId);
+          if (writeLease)
+            this.store.releaseLease(
+              task.task_id,
+              "workspace_write",
+              session.session_id,
+            );
+        })
+        .catch(() => {});
+      return {
+        run,
+        assignment: this.store.getAssignment(assignmentId),
+        completion,
+      };
+    } catch (error) {
+      if (runId) this.providerResolver?.cleanup?.(runId);
+      if (writeLease)
+        this.store.releaseLease(
+          task.task_id,
+          "workspace_write",
+          session.session_id,
+        );
+      throw error;
+    }
+  }
+  async #ensureMissionWorkspace(task, repositoryRoot) {
+    const root = resolve(repositoryRoot),
+      existing = this.store.getMissionWorkspace(task.task_id);
+    if (existing) {
+      if (existing.repository_root !== root)
+        throw new Error(
+          `MissionWorkspace repository mismatch: expected=${existing.repository_root}, actual=${root}`,
+        );
+      if (existing.base_commit !== task.source.base_commit)
+        throw new Error("MissionWorkspace base commit mismatch");
+      return existing;
+    }
+    const pending = this.workspacePreparing.get(task.task_id);
+    if (pending) return pending;
+    const preparation = (async () => {
+      const worktree = await createMissionWorktree({
+        repositoryRoot: root,
+        baseCommit: task.source.base_commit,
+        worktreesRoot: this.worktreesRoot,
+        workspaceId: task.task_id,
+      });
+      return this.store.createMissionWorkspace(task.task_id, {
+        task_revision: task.revision,
+        repository_root: root,
+        ...worktree,
+      });
+    })();
+    this.workspacePreparing.set(task.task_id, preparation);
+    try {
+      return await preparation;
+    } finally {
+      this.workspacePreparing.delete(task.task_id);
+    }
+  }
   async #execute({
     runId,
     task,
@@ -120,6 +271,11 @@ export class ControlPlaneOrchestrator {
     runtimeOptions,
     requestedModel,
     executable,
+    expectedModel = task.execution.expected_model,
+    assignmentId = null,
+    actor = { role: "Worker", id: adapter.runtimeId },
+    missionMode = false,
+    runtimeEnv = {},
   }) {
     const raw = [];
     try {
@@ -130,6 +286,7 @@ export class ControlPlaneOrchestrator {
           runtime_options: runtimeOptions,
           requested_model: requestedModel,
           executable,
+          env: runtimeEnv,
         },
         { raw: (stream, chunk) => raw.push({ stream, chunk }), line: () => {} },
       );
@@ -186,7 +343,7 @@ export class ControlPlaneOrchestrator {
           if (normalized.actual_model) actualModel = normalized.actual_model;
           if (!normalized.event) continue;
           this.store.appendEvent(runId, {
-            actor: { role: "Worker", id: adapter.runtimeId },
+            actor,
             source: {
               kind: "runtime",
               raw_artifact_id: rawArtifact.artifact_id,
@@ -205,10 +362,11 @@ export class ControlPlaneOrchestrator {
         this.store.transitionRun(runId, "canceled", {
           reason_code: timedOut ? "runtime_timeout" : "user_requested",
         });
-        this.store.transitionTask(task.task_id, task.revision, "blocked");
+        if (missionMode)
+          this.store.transitionAssignment(assignmentId, "canceled");
+        else this.store.transitionTask(task.task_id, task.revision, "blocked");
         return this.store.getRun(runId);
       }
-      const expectedModel = task.execution.expected_model;
       const modelMismatch = expectedModel && actualModel !== expectedModel;
       if (result.exit_code !== 0 || !credible || timedOut || modelMismatch) {
         const reasonCode = timedOut
@@ -224,7 +382,49 @@ export class ControlPlaneOrchestrator {
             ? `expected=${expectedModel}, actual=${actualModel ?? "unknown"}`
             : `exit=${result.exit_code}`,
         });
-        this.store.transitionTask(task.task_id, task.revision, "blocked");
+        if (missionMode)
+          this.store.transitionAssignment(assignmentId, "failed");
+        else this.store.transitionTask(task.task_id, task.revision, "blocked");
+        return this.store.getRun(runId);
+      }
+      if (missionMode) {
+        const gitEvidence = await captureGitEvidence(
+          worktree.worktree_path,
+          task.source.base_commit,
+        );
+        this.store.createArtifact(runId, {
+          kind: "git_snapshot",
+          media_type: "application/json",
+          source: "workspace",
+          data: gitEvidence,
+          extension: "json",
+        });
+        const scope = evaluateScope(task.scope, gitEvidence.changed_files),
+          scopeArtifact = this.store.createArtifact(runId, {
+            kind: "scope_check",
+            media_type: "application/json",
+            source: "workspace",
+            data: scope,
+            extension: "json",
+          });
+        this.store.recordVerification(runId, {
+          gate_id: "control-plane:scope",
+          kind: "custom",
+          required: true,
+          status: scope.status,
+          exit_code: scope.status === "passed" ? 0 : 1,
+          observed_tests: null,
+          result_artifact_id: scopeArtifact.artifact_id,
+        });
+        if (scope.status === "passed") {
+          this.store.transitionRun(runId, "completed");
+          this.store.transitionAssignment(assignmentId, "completed");
+        } else {
+          this.store.transitionRun(runId, "failed", {
+            reason_code: "scope_violation",
+          });
+          this.store.transitionAssignment(assignmentId, "failed");
+        }
         return this.store.getRun(runId);
       }
       this.store.transitionRun(runId, "completed");
@@ -295,7 +495,13 @@ export class ControlPlaneOrchestrator {
           { reason_code: "orchestrator_error", reason: error.message },
         );
       const currentTask = this.store.getTask(task.task_id, task.revision);
-      if (["running", "verifying"].includes(currentTask?.state))
+      const currentAssignment = assignmentId
+        ? this.store.getAssignment(assignmentId)
+        : null;
+      if (missionMode) {
+        if (["assigned", "running"].includes(currentAssignment?.state))
+          this.store.transitionAssignment(assignmentId, "failed");
+      } else if (["running", "verifying"].includes(currentTask?.state))
         this.store.transitionTask(task.task_id, task.revision, "blocked");
       throw error;
     }
