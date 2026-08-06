@@ -1,0 +1,53 @@
+{
+  "schema": "cross-agent/task-spec/v1",
+  "title": "Example repository change",
+  "goal": "Implement the requested change and produce independently verifiable evidence.",
+  "source": {
+    "repository_id": "local/example",
+    "base_commit": "REPLACE_WITH_EXACT_GIT_COMMIT"
+  },
+  "scope": {
+    "allow": ["src/**", "tests/**"],
+    "deny": [".env", "**/secrets/**"]
+  },
+  "acceptance": [
+    {
+      "criterion_id": "ac_1",
+      "statement": "The requested behavior is implemented and covered by tests."
+    }
+  ],
+  "verification": {
+    "gates": [
+      {
+        "gate_id": "unit",
+        "kind": "test",
+        "argv": ["npm", "test"],
+        "required": true,
+        "min_tests": 1,
+        "parser": "generic",
+        "timeout_seconds": 300
+      }
+    ]
+  },
+  "guardrails": {
+    "irreversible_actions": {
+      "commit": "human_required",
+      "merge": "human_required",
+      "push": "human_required",
+      "publish": "human_required",
+      "discard": "human_required"
+    }
+  },
+  "execution": {
+    "preferred_runtime": "fake",
+    "required_capabilities": ["structured_events", "model_observation"],
+    "expected_model": "deterministic-fake-v1",
+    "budget": {
+      "timeout_seconds": 600
+    }
+  },
+  "metadata": {
+    "task_class": "software-change",
+    "labels": ["example"]
+  }
+}
