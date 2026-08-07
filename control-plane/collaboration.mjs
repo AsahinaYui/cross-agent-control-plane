@@ -156,6 +156,29 @@ export function finalizeAssignment({ task, plan, stage, input, session }) {
   };
 }
 
+export function finalizeHandoff({ task, input, assignment, run }) {
+  if (!task) throw new Error("Handoff requires an existing task");
+  if (!assignment || assignment.task_id !== task.task_id)
+    throw new Error("Handoff requires a source Assignment from the same task");
+  if (!run)
+    throw new Error("Handoff requires a source Assignment with a bound run");
+  if (run && run.run_id !== assignment.run_id)
+    throw new Error("Handoff run does not match its source Assignment");
+  return {
+    schema: SCHEMAS.handoff,
+    handoff_id: input.handoff_id ?? makeId("hnd"),
+    task_id: task.task_id,
+    task_revision: task.revision,
+    plan_revision: assignment.plan_revision,
+    from_assignment_id: assignment.assignment_id,
+    from_run_id: run?.run_id ?? input.from_run_id ?? null,
+    to_stage_id: input.to_stage_id ?? null,
+    summary: requiredString(input.summary, "summary"),
+    content: requiredString(input.content, "content"),
+    created_at: nowIso(),
+  };
+}
+
 export function assertAssignmentTransition(from, to) {
   if (!(ASSIGNMENT_TRANSITIONS[from] ?? []).includes(to))
     throw new Error(`Invalid assignment transition: ${from} -> ${to}`);

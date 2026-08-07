@@ -6,6 +6,21 @@ import { captureGitEvidence, createMissionWorktree } from "./worktree.mjs";
 import { runVerificationMatrix } from "./verification.mjs";
 import { evaluateScope } from "./scope.mjs";
 
+function assignmentPrompt(assignment, inboundHandoffs) {
+  const permission = assignment.write_intent
+    ? "You may modify project files in the shared mission worktree."
+    : "This is a read-only assignment. Do not create, modify, or delete project files. Return your result as a handoff for the next assignment.";
+  const handoffs = inboundHandoffs.length
+    ? `\n\nInbound handoffs:\n${inboundHandoffs
+        .map(
+          (handoff) =>
+            `--- ${handoff.summary} (${handoff.handoff_id}) ---\n${handoff.content}`,
+        )
+        .join("\n\n")}`
+    : "";
+  return `${permission}\n\n${assignment.prompt}${handoffs}`;
+}
+
 export class ControlPlaneOrchestrator {
   constructor({
     store,
@@ -137,7 +152,11 @@ export class ControlPlaneOrchestrator {
         throw new Error(
           `${assignment.profile.runtime_id} lacks required capability: ${capability}`,
         );
-    const worktree = await this.#ensureMissionWorkspace(task, repositoryRoot);
+    const worktree = await this.#ensureMissionWorkspace(task, repositoryRoot),
+      inboundHandoffs = this.store.listHandoffs(task.task_id, {
+        toStageId: assignment.stage_id,
+      }),
+      executionPrompt = assignmentPrompt(assignment, inboundHandoffs);
     let writeLease = null,
       runId = null;
     if (assignment.write_intent)
@@ -168,6 +187,20 @@ export class ControlPlaneOrchestrator {
           runtime_capabilities: descriptor.capabilities,
           assigned_actor: { kind: "session", id: session.session_id },
           assignment_id: assignmentId,
+          write_intent: assignment.write_intent,
+          input_handoff_ids: inboundHandoffs.map(
+            (handoff) => handoff.handoff_id,
+          ),
+        });
+      if (inboundHandoffs.length)
+        this.store.appendEvent(runId, {
+          actor: { role: "System", id: "control-plane" },
+          source: { kind: "control-plane" },
+          type: "assignment.handoff_received",
+          summary: `Received ${inboundHandoffs.length} handoff${inboundHandoffs.length === 1 ? "" : "s"}`,
+          data: {
+            handoff_ids: inboundHandoffs.map((handoff) => handoff.handoff_id),
+          },
         });
       this.store.bindAssignmentRun(assignmentId, runId);
       this.store.transitionRun(runId, "preparing");
@@ -189,7 +222,7 @@ export class ControlPlaneOrchestrator {
         task,
         adapter,
         worktree,
-        prompt: assignment.prompt,
+        prompt: executionPrompt,
         runtimeOptions,
         requestedModel: assignment.profile.model_id,
         executable,
@@ -198,6 +231,7 @@ export class ControlPlaneOrchestrator {
         actor: { role: assignment.role, id: session.session_id },
         missionMode: true,
         runtimeEnv: providerLaunch.env,
+        writeIntent: assignment.write_intent,
       });
       active.completion = completion;
       void completion
@@ -276,8 +310,10 @@ export class ControlPlaneOrchestrator {
     actor = { role: "Worker", id: adapter.runtimeId },
     missionMode = false,
     runtimeEnv = {},
+    writeIntent = true,
   }) {
-    const raw = [];
+    const raw = [],
+      messages = [];
     try {
       const handle = await adapter.start(
         {
@@ -287,6 +323,7 @@ export class ControlPlaneOrchestrator {
           requested_model: requestedModel,
           executable,
           env: runtimeEnv,
+          write_intent: writeIntent,
         },
         { raw: (stream, chunk) => raw.push({ stream, chunk }), line: () => {} },
       );
@@ -342,6 +379,10 @@ export class ControlPlaneOrchestrator {
           }
           if (normalized.actual_model) actualModel = normalized.actual_model;
           if (!normalized.event) continue;
+          if (normalized.event.type === "agent.message")
+            messages.push(
+              normalized.event.data?.text ?? normalized.event.summary,
+            );
           this.store.appendEvent(runId, {
             actor,
             source: {
@@ -417,6 +458,25 @@ export class ControlPlaneOrchestrator {
           result_artifact_id: scopeArtifact.artifact_id,
         });
         if (scope.status === "passed") {
+          const assignment = this.store.getAssignment(assignmentId),
+            plan = this.store.getExecutionPlan(
+              task.task_id,
+              assignment.plan_revision,
+            ),
+            stageIndex = plan.stages.findIndex(
+              (stage) => stage.stage_id === assignment.stage_id,
+            ),
+            nextStage = stageIndex >= 0 ? plan.stages[stageIndex + 1] : null,
+            content =
+              messages.filter(Boolean).join("\n\n") ||
+              `${assignment.role} completed without a textual final response.`;
+          this.store.createHandoff(task.task_id, {
+            task_revision: task.revision,
+            from_assignment_id: assignmentId,
+            to_stage_id: nextStage?.stage_id ?? null,
+            summary: `${assignment.role} handoff`,
+            content,
+          });
           this.store.transitionRun(runId, "completed");
           this.store.transitionAssignment(assignmentId, "completed");
         } else {

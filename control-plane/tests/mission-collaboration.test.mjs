@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { ControlPlaneOrchestrator } from "../orchestrator.mjs";
+import { createRuntimeAdapter } from "../runtime-adapters.mjs";
 import { createControlPlaneServer } from "../server.mjs";
 import { ControlPlaneStore } from "../store.mjs";
 import { createGitFixture, taskInput, tempDir } from "./helpers.mjs";
@@ -182,14 +183,118 @@ test("assignment runs reuse one mission worktree and enforce leases", async () =
   );
   const activity = store.getTaskActivity(task.task_id);
   assert.equal(activity.assignments.length, 2);
+  assert.equal(activity.handoffs.length, 2);
   assert.equal(activity.runs.length, 2);
   assert.equal(activity.workspace.worktree_path, firstWorkspace.worktree_path);
 
   const rebuilt = store.rebuildIndex();
   assert.equal(rebuilt.sessions, 2);
   assert.equal(rebuilt.assignments, 2);
+  assert.equal(rebuilt.handoffs, 2);
   assert.equal(store.getExecutionPlan(task.task_id).revision, 1);
   assert.equal(store.getMissionWorkspace(task.task_id).task_id, task.task_id);
+  store.close();
+  rmSync(repository.root, { recursive: true, force: true });
+  rmSync(state, { recursive: true, force: true });
+});
+
+test("a read-only assignment hands its result to the next stage outside the worktree", async () => {
+  const repository = await createGitFixture("mission-handoff"),
+    state = tempDir("mission-handoff"),
+    store = new ControlPlaneStore(state),
+    task = store.createTask(taskInput(repository.head)),
+    starts = [],
+    orchestrator = new ControlPlaneOrchestrator({
+      store,
+      worktreesRoot: join(state, "worktrees"),
+      runtimeAdapterFactory(runtimeId) {
+        const adapter = createRuntimeAdapter(runtimeId),
+          start = adapter.start.bind(adapter);
+        adapter.start = (input, sinks) => {
+          starts.push(structuredClone(input));
+          return start(input, sinks);
+        };
+        return adapter;
+      },
+    }),
+    directionProfile = { ...workerProfile, profile_id: "direction" },
+    implementationProfile = {
+      ...workerProfile,
+      profile_id: "implementation",
+    };
+  store.createExecutionPlan(task.task_id, {
+    fallback_policy: "disabled",
+    coordinator_surface: "codex-desktop",
+    stages: [
+      {
+        stage_id: "direction",
+        role: "Direction",
+        responsibility: "Analyze the task and hand off an implementation plan",
+        write_intent: false,
+        profile: directionProfile,
+      },
+      {
+        stage_id: "implementation",
+        role: "Implementation",
+        responsibility: "Implement the approved direction",
+        write_intent: true,
+        profile: implementationProfile,
+      },
+    ],
+  });
+  const coordinator = store.attachSession(task.task_id, {
+      profile_id: "coordinator",
+      runtime_id: "fake",
+      provider_id: "coordinator",
+      model_id: "deterministic-fake-v1",
+      billing_channel: "subscription",
+      surface: "codex-desktop",
+      role: "Coordinator",
+    }),
+    directionSession = store.attachSession(task.task_id, {
+      ...directionProfile,
+      surface: "codex-cli",
+      role: "Direction",
+    }),
+    implementationSession = store.attachSession(task.task_id, {
+      ...implementationProfile,
+      surface: "claude-cli",
+      role: "Implementation",
+    });
+  store.acquireLease(task.task_id, "coordinator", coordinator.session_id, {
+    ttl_seconds: 300,
+  });
+  const direction = store.createAssignment(task.task_id, {
+      stage_id: "direction",
+      session_id: directionSession.session_id,
+    }),
+    first = await orchestrator.startAssignment({
+      assignmentId: direction.assignment_id,
+      coordinatorSessionId: coordinator.session_id,
+      repositoryRoot: repository.root,
+    });
+  await first.completion;
+  const handoff = store.listHandoffs(task.task_id)[0];
+  assert.equal(handoff.from_assignment_id, direction.assignment_id);
+  assert.equal(handoff.to_stage_id, "implementation");
+  assert.match(handoff.content, /Fake worker started/);
+  assert.equal(starts[0].write_intent, false);
+
+  const implementation = store.createAssignment(task.task_id, {
+      stage_id: "implementation",
+      session_id: implementationSession.session_id,
+    }),
+    second = await orchestrator.startAssignment({
+      assignmentId: implementation.assignment_id,
+      coordinatorSessionId: coordinator.session_id,
+      repositoryRoot: repository.root,
+    });
+  assert.deepEqual(second.run.context.input_handoff_ids, [handoff.handoff_id]);
+  assert.match(starts[1].prompt, new RegExp(handoff.handoff_id));
+  assert.match(starts[1].prompt, /Fake worker started/);
+  assert.equal(starts[1].write_intent, true);
+  await second.completion;
+
   store.close();
   rmSync(repository.root, { recursive: true, force: true });
   rmSync(state, { recursive: true, force: true });
@@ -266,6 +371,11 @@ test("headless API exposes plan, session, lease, assignment, and activity", asyn
   const activity = await (await fetch(`${base}/activity`)).json();
   assert.equal(activity.execution_plan.fallback_policy, "disabled");
   assert.equal(activity.assignments[0].state, "completed");
+  assert.equal(activity.handoffs.length, 1);
+  assert.equal(
+    (await (await fetch(`${base}/handoffs`)).json()).items.length,
+    1,
+  );
   assert.equal(activity.workspace.task_id, task.task_id);
   await new Promise((resolve) => server.close(resolve));
   store.close();

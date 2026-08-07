@@ -2,7 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { createRuntimeAdapter } from "../runtime-adapters.mjs";
+import {
+  buildClaudeCommand,
+  buildCodexCommand,
+  createRuntimeAdapter,
+} from "../runtime-adapters.mjs";
 import { createControlPlaneServer } from "../server.mjs";
 import { ControlPlaneStore } from "../store.mjs";
 import { ControlPlaneOrchestrator } from "../orchestrator.mjs";
@@ -29,10 +33,34 @@ test("Claude and Codex adapters normalize their own fixtures without changing co
     type: "item.completed",
     item: { type: "agent_message", text: "done" },
   });
-  assert.deepEqual(xMessage.event.data, { channel: "progress" });
+  assert.deepEqual(xMessage.event.data, { channel: "progress", text: "done" });
   assert.equal(
     codex.normalize({ type: "turn.completed" }).terminal.completed,
     true,
+  );
+});
+
+test("read-only assignments use runtime-enforced read-only modes", () => {
+  const input = {
+    prompt: "Inspect and hand off",
+    requested_model: "fixed-model",
+    write_intent: false,
+  };
+  const codex = buildCodexCommand(input),
+    claude = buildClaudeCommand(input);
+  assert.equal(codex[codex.indexOf("--sandbox") + 1], "read-only");
+  assert.equal(claude[claude.indexOf("--permission-mode") + 1], "plan");
+  assert.equal(
+    buildCodexCommand({ ...input, write_intent: true })[
+      codex.indexOf("--sandbox") + 1
+    ],
+    "workspace-write",
+  );
+  assert.equal(
+    buildClaudeCommand({ ...input, write_intent: true })[
+      claude.indexOf("--permission-mode") + 1
+    ],
+    "dontAsk",
   );
 });
 

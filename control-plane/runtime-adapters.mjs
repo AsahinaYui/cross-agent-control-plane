@@ -27,20 +27,35 @@ class ProcessRuntimeAdapter {
 export class FakeRuntimeAdapter extends ProcessRuntimeAdapter {
   constructor() { super("fake","1.0.0",(input)=>[process.execPath,join(here,"fake-runtime.mjs"),"--mode",input.runtime_options?.mode??"success"]); }
 }
+
+export function buildClaudeCommand(input) {
+  return [input.executable??"claude","--print","--output-format","stream-json","--verbose","--permission-mode",input.write_intent===false?"plan":"dontAsk",...(input.requested_model?["--model",input.requested_model]:[]),input.prompt];
+}
+
+export function buildCodexCommand(input) {
+  return [input.executable??"codex","exec","--json","--sandbox",input.write_intent===false?"read-only":"workspace-write","--ask-for-approval","never",...(input.requested_model?["--model",input.requested_model]:[]),input.prompt];
+}
+
+function claudeMessageText(parsed) {
+  const content=parsed?.message?.content;
+  if(!Array.isArray(content)) return null;
+  return content.filter((item)=>item?.type==="text"&&typeof item.text==="string").map((item)=>item.text.trim()).filter(Boolean).join("\n")||null;
+}
+
 export class ClaudeRuntimeAdapter extends ProcessRuntimeAdapter {
-  constructor() { super("claude-cli","1.0.0",(input)=>[input.executable??"claude","--print","--output-format","stream-json","--verbose","--permission-mode","dontAsk",...(input.requested_model?["--model",input.requested_model]:[]),input.prompt],{usage_observation:true}); }
+  constructor() { super("claude-cli","1.0.0",buildClaudeCommand,{usage_observation:true}); }
   normalize(parsed) {
     if(parsed.type==="system"&&parsed.subtype==="init") return {actual_model:parsed.model??null,event:{type:"model.observed",summary:"Claude runtime initialized",data:{runtime:{actual_model:parsed.model??"unknown"},provider:{requested_route:"external-cli"}}}};
-    if(parsed.type==="assistant") return {event:{type:"agent.message",summary:"Claude assistant message",data:{channel:"progress"}}};
+    if(parsed.type==="assistant") { const text=claudeMessageText(parsed); return {event:{type:"agent.message",summary:text??"Claude assistant message",data:{channel:"progress",...(text?{text}:{})}}}; }
     if(parsed.type==="result") return {terminal:{completed:parsed.subtype==="success"&&parsed.is_error!==true}};
     return {};
   }
 }
 export class CodexRuntimeAdapter extends ProcessRuntimeAdapter {
-  constructor() { super("codex-cli","1.0.0",(input)=>[input.executable??"codex","exec","--json","--sandbox","workspace-write","--ask-for-approval","never",...(input.requested_model?["--model",input.requested_model]:[]),input.prompt],{usage_observation:true}); }
+  constructor() { super("codex-cli","1.0.0",buildCodexCommand,{usage_observation:true}); }
   normalize(parsed) {
     if(parsed.type==="session.configured"||parsed.type==="model.observed") return {actual_model:parsed.model??parsed.data?.runtime?.actual_model??null,event:{type:"model.observed",summary:"Codex runtime configured",data:{runtime:{actual_model:parsed.model??parsed.data?.runtime?.actual_model??"unknown"},provider:{requested_route:"external-cli"}}}};
-    if(parsed.type==="item.completed"&&parsed.item?.type==="agent_message") return {event:{type:"agent.message",summary:parsed.item.text??"Codex assistant message",data:{channel:"progress"}}};
+    if(parsed.type==="item.completed"&&parsed.item?.type==="agent_message") return {event:{type:"agent.message",summary:parsed.item.text??"Codex assistant message",data:{channel:"progress",...(parsed.item.text?{text:parsed.item.text}:{})}}};
     if(parsed.type==="turn.completed") return {terminal:{completed:true}};
     if(parsed.type==="error"||parsed.type==="turn.failed") return {terminal:{completed:false}};
     return {};

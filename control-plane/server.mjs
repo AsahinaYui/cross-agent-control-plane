@@ -128,6 +128,20 @@ export function createControlPlaneServer({
       if (
         req.method === "GET" &&
         parts[1] === "tasks" &&
+        parts[3] === "handoffs" &&
+        parts.length === 4
+      )
+        return json(res, 200, { items: store.listHandoffs(parts[2]) });
+      if (
+        req.method === "POST" &&
+        parts[1] === "tasks" &&
+        parts[3] === "handoffs" &&
+        parts.length === 4
+      )
+        return json(res, 201, store.createHandoff(parts[2], await body(req)));
+      if (
+        req.method === "GET" &&
+        parts[1] === "tasks" &&
         parts[3] === "assignments" &&
         parts.length === 4
       )

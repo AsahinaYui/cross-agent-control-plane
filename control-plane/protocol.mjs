@@ -5,6 +5,7 @@ export const SCHEMAS = Object.freeze({
   executionPlan: "cross-agent/execution-plan/v1",
   agentSession: "cross-agent/agent-session/v1",
   assignment: "cross-agent/assignment/v1",
+  handoff: "cross-agent/handoff/v1",
   missionWorkspace: "cross-agent/mission-workspace/v1",
   missionLease: "cross-agent/mission-lease/v1",
   event: "cross-agent/agent-event/v1",

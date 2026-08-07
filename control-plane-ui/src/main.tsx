@@ -163,6 +163,17 @@ const previewActivity: TaskActivity = {
       updated_at: new Date().toISOString(),
     },
   ],
+  handoffs: [
+    {
+      handoff_id: "handoff-direction",
+      from_assignment_id: "preview-direction",
+      from_run_id: "run-direction",
+      to_stage_id: "02-implementation",
+      summary: "Project Direction handoff",
+      content: "Implementation direction is ready for the coding assignment.",
+      created_at: new Date(Date.now() - 180_000).toISOString(),
+    },
+  ],
   runs: [
     {
       run_id: "run-direction",
@@ -775,7 +786,7 @@ function SettingsPanel({
                           update(index, { writeIntent: event.target.checked })
                         }
                       />
-                      允许写入
+                      允许修改项目文件
                     </label>
                   </div>
                   <textarea

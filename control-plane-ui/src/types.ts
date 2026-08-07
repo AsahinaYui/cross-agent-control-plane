@@ -87,6 +87,16 @@ export interface ActivityEvent {
   recorded_at: string;
 }
 
+export interface ActivityHandoff {
+  handoff_id: string;
+  from_assignment_id: string;
+  from_run_id: string | null;
+  to_stage_id: string | null;
+  summary: string;
+  content: string;
+  created_at: string;
+}
+
 export interface TaskActivity {
   task: TaskSummary;
   execution_plan: {
@@ -108,6 +118,7 @@ export interface TaskActivity {
     }>;
   } | null;
   assignments: ActivityAssignment[];
+  handoffs: ActivityHandoff[];
   runs: ActivityRun[];
   events: ActivityEvent[];
   workspace: { worktree_path: string } | null;

@@ -28,6 +28,7 @@ import {
   finalizeAgentSession,
   finalizeAssignment,
   finalizeExecutionPlan,
+  finalizeHandoff,
   makeMissionLease,
 } from "./collaboration.mjs";
 
@@ -57,6 +58,7 @@ export class ControlPlaneStore {
     this.plansRoot = ensureDir(join(this.root, "execution-plans"));
     this.sessionsRoot = ensureDir(join(this.root, "sessions"));
     this.assignmentsRoot = ensureDir(join(this.root, "assignments"));
+    this.handoffsRoot = ensureDir(join(this.root, "handoffs"));
     this.workspacesRoot = ensureDir(join(this.root, "mission-workspaces"));
     this.db = new DatabaseSync(join(this.root, "index.sqlite"));
     this.db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
@@ -78,12 +80,14 @@ export class ControlPlaneStore {
       CREATE TABLE IF NOT EXISTS execution_plans(task_id TEXT,revision INTEGER,plan_hash TEXT,path TEXT,created_at TEXT,PRIMARY KEY(task_id,revision));
       CREATE TABLE IF NOT EXISTS agent_sessions(session_id TEXT PRIMARY KEY,task_id TEXT,surface TEXT,role TEXT,runtime_id TEXT,provider_id TEXT,model_id TEXT,billing_channel TEXT,state TEXT,external_session_id TEXT,path TEXT,created_at TEXT,updated_at TEXT,last_seen_at TEXT);
       CREATE TABLE IF NOT EXISTS assignments(assignment_id TEXT PRIMARY KEY,task_id TEXT,task_revision INTEGER,plan_revision INTEGER,stage_id TEXT,role TEXT,state TEXT,session_id TEXT,run_id TEXT,write_intent INTEGER,path TEXT,created_at TEXT,updated_at TEXT);
+      CREATE TABLE IF NOT EXISTS handoffs(handoff_id TEXT PRIMARY KEY,task_id TEXT,task_revision INTEGER,plan_revision INTEGER,from_assignment_id TEXT,from_run_id TEXT,to_stage_id TEXT,path TEXT,created_at TEXT);
       CREATE TABLE IF NOT EXISTS mission_workspaces(task_id TEXT PRIMARY KEY,repository_root TEXT,worktree_id TEXT,worktree_path TEXT,base_commit TEXT,path TEXT,created_at TEXT,updated_at TEXT);
       CREATE TABLE IF NOT EXISTS mission_leases(task_id TEXT,lease_kind TEXT,holder_session_id TEXT,assignment_id TEXT,expires_at TEXT,path TEXT,updated_at TEXT,PRIMARY KEY(task_id,lease_kind));
       CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id,sequence);
       CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id,created_at);
       CREATE INDEX IF NOT EXISTS idx_sessions_task ON agent_sessions(task_id,updated_at);
       CREATE INDEX IF NOT EXISTS idx_assignments_task ON assignments(task_id,created_at);
+      CREATE INDEX IF NOT EXISTS idx_handoffs_task ON handoffs(task_id,created_at);
     `);
   }
 
@@ -381,6 +385,62 @@ export class ControlPlaneStore {
       );
   }
 
+  createHandoff(taskId, input) {
+    const task = this.getTask(taskId, input.task_revision),
+      assignment = this.getAssignment(input.from_assignment_id),
+      run = assignment?.run_id ? this.getRun(assignment.run_id) : null,
+      handoff = finalizeHandoff({ task, input, assignment, run }),
+      path = childPath(this.handoffsRoot, `${handoff.handoff_id}.json`);
+    if (this.getHandoff(handoff.handoff_id))
+      throw new Error(`Handoff already exists: ${handoff.handoff_id}`);
+    atomicJson(path, handoff);
+    this.db
+      .prepare("INSERT INTO handoffs VALUES(?,?,?,?,?,?,?,?,?)")
+      .run(
+        handoff.handoff_id,
+        handoff.task_id,
+        handoff.task_revision,
+        handoff.plan_revision,
+        handoff.from_assignment_id,
+        handoff.from_run_id,
+        handoff.to_stage_id,
+        path,
+        handoff.created_at,
+      );
+    if (handoff.from_run_id)
+      this.appendEvent(handoff.from_run_id, {
+        actor: { role: assignment.role, id: assignment.session_id },
+        source: { kind: "control-plane" },
+        type: "assignment.handoff_created",
+        summary: handoff.summary,
+        data: {
+          handoff_id: handoff.handoff_id,
+          to_stage_id: handoff.to_stage_id,
+        },
+      });
+    return handoff;
+  }
+  getHandoff(handoffId) {
+    const row = this.db
+      .prepare("SELECT path FROM handoffs WHERE handoff_id=?")
+      .get(handoffId);
+    return row ? readJson(row.path) : null;
+  }
+  listHandoffs(taskId, { toStageId } = {}) {
+    const rows = toStageId
+      ? this.db
+          .prepare(
+            "SELECT path FROM handoffs WHERE task_id=? AND to_stage_id=? ORDER BY created_at",
+          )
+          .all(taskId, toStageId)
+      : this.db
+          .prepare(
+            "SELECT path FROM handoffs WHERE task_id=? ORDER BY created_at",
+          )
+          .all(taskId);
+    return rows.map((row) => readJson(row.path));
+  }
+
   createMissionWorkspace(taskId, input) {
     const task = this.getTask(taskId, input.task_revision);
     if (!task) throw new Error(`Unknown task: ${taskId}`);
@@ -524,6 +584,7 @@ export class ControlPlaneStore {
       leases: this.listLeases(taskId),
       sessions: this.listSessions(taskId),
       assignments: this.listAssignments(taskId),
+      handoffs: this.listHandoffs(taskId),
       runs,
       events,
     };
@@ -570,6 +631,8 @@ export class ControlPlaneStore {
       },
       runtime_capabilities: input.runtime_capabilities ?? {},
       assignment_id: input.assignment_id ?? null,
+      write_intent: input.write_intent ?? null,
+      input_handoff_ids: input.input_handoff_ids ?? [],
       created_at: nowIso(),
     };
     atomicJson(childPath(this.runsRoot, runId, "run-context.json"), context);
@@ -1027,7 +1090,7 @@ export class ControlPlaneStore {
 
   rebuildIndex() {
     this.db.exec(
-      "DELETE FROM mission_leases;DELETE FROM mission_workspaces;DELETE FROM assignments;DELETE FROM agent_sessions;DELETE FROM execution_plans;DELETE FROM corrections;DELETE FROM audit_decisions;DELETE FROM bundles;DELETE FROM verification_results;DELETE FROM artifacts;DELETE FROM events;DELETE FROM runs;DELETE FROM tasks;",
+      "DELETE FROM mission_leases;DELETE FROM mission_workspaces;DELETE FROM handoffs;DELETE FROM assignments;DELETE FROM agent_sessions;DELETE FROM execution_plans;DELETE FROM corrections;DELETE FROM audit_decisions;DELETE FROM bundles;DELETE FROM verification_results;DELETE FROM artifacts;DELETE FROM events;DELETE FROM runs;DELETE FROM tasks;",
     );
     for (const taskId of readdirSync(this.tasksRoot, { withFileTypes: true })
       .filter((x) => x.isDirectory())
@@ -1261,6 +1324,25 @@ export class ControlPlaneStore {
           assignment.updated_at,
         );
     }
+    for (const file of readdirSync(this.handoffsRoot).filter((x) =>
+      x.endsWith(".json"),
+    )) {
+      const path = join(this.handoffsRoot, file),
+        handoff = readJson(path);
+      this.db
+        .prepare("INSERT INTO handoffs VALUES(?,?,?,?,?,?,?,?,?)")
+        .run(
+          handoff.handoff_id,
+          handoff.task_id,
+          handoff.task_revision,
+          handoff.plan_revision,
+          handoff.from_assignment_id,
+          handoff.from_run_id,
+          handoff.to_stage_id,
+          path,
+          handoff.created_at,
+        );
+    }
     for (const file of readdirSync(this.workspacesRoot).filter((x) =>
       x.endsWith(".json"),
     )) {
@@ -1316,6 +1398,9 @@ export class ControlPlaneStore {
       ),
       assignments: Number(
         this.db.prepare("SELECT COUNT(*) count FROM assignments").get().count,
+      ),
+      handoffs: Number(
+        this.db.prepare("SELECT COUNT(*) count FROM handoffs").get().count,
       ),
     };
   }
