@@ -132,6 +132,7 @@ export interface OverlayBridge {
   ): Promise<T>;
   detectProviders(): Promise<ExecutionCatalog>;
   setInteractive(interactive: boolean): void;
+  setFocusable(focusable: boolean): void;
   togglePin(): Promise<boolean>;
   minimize(): void;
   quit(): void;

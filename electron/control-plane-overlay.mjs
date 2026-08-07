@@ -12,6 +12,10 @@ import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildProviderCatalog } from "./control-plane-provider-catalog.mjs";
+import {
+  applyOverlayFocusability,
+  createOverlayWindowOptions,
+} from "./control-plane-overlay-window.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(__dirname, "..");
@@ -60,31 +64,13 @@ async function ensureBackend() {
 
 function createOverlayWindow() {
   const area = screen.getPrimaryDisplay().workArea;
-  overlayWindow = new BrowserWindow({
-    x: area.x,
-    y: area.y,
-    width: area.width,
-    height: area.height,
-    minWidth: 900,
-    minHeight: 600,
-    frame: false,
-    transparent: true,
-    backgroundColor: "#00000000",
-    hasShadow: false,
-    resizable: false,
-    alwaysOnTop: true,
-    skipTaskbar: false,
-    show: false,
-    title: "Cross Agent Overlay",
-    icon: appIconPath,
-    webPreferences: {
-      preload: join(__dirname, "control-plane-overlay-preload.cjs"),
-      nodeIntegration: false,
-      contextIsolation: true,
-      sandbox: true,
-      backgroundThrottling: false,
-    },
-  });
+  overlayWindow = new BrowserWindow(
+    createOverlayWindowOptions({
+      area,
+      preloadPath: join(__dirname, "control-plane-overlay-preload.cjs"),
+      iconPath: appIconPath,
+    }),
+  );
   overlayWindow.setAlwaysOnTop(true, "floating");
   overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   overlayWindow.setMenuBarVisibility(false);
@@ -162,6 +148,11 @@ ipcMain.handle("overlay:detect-providers", (event) => {
 ipcMain.on("overlay:set-interactive", (event, interactive) => {
   if (!isOverlaySender(event) || !overlayWindow) return;
   overlayWindow.setIgnoreMouseEvents(!interactive, { forward: true });
+});
+
+ipcMain.on("overlay:set-focusable", (event, focusable) => {
+  if (!isOverlaySender(event) || !overlayWindow) return;
+  applyOverlayFocusability(overlayWindow, Boolean(focusable));
 });
 
 ipcMain.handle("overlay:toggle-pin", (event) => {

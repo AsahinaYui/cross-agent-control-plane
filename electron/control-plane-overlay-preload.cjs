@@ -5,6 +5,8 @@ contextBridge.exposeInMainWorld("controlPlaneOverlay", {
   detectProviders: () => ipcRenderer.invoke("overlay:detect-providers"),
   setInteractive: (interactive) =>
     ipcRenderer.send("overlay:set-interactive", Boolean(interactive)),
+  setFocusable: (focusable) =>
+    ipcRenderer.send("overlay:set-focusable", Boolean(focusable)),
   togglePin: () => ipcRenderer.invoke("overlay:toggle-pin"),
   minimize: () => ipcRenderer.send("overlay:minimize"),
   quit: () => ipcRenderer.send("overlay:quit"),

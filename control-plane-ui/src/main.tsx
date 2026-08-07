@@ -867,6 +867,11 @@ function OverlayApp() {
   }, [coordinatorSurface]);
 
   useEffect(() => {
+    window.controlPlaneOverlay?.setFocusable(settingsOpen);
+    return () => window.controlPlaneOverlay?.setFocusable(false);
+  }, [settingsOpen]);
+
+  useEffect(() => {
     void detectProviders().then((catalog) => {
       setRuntimes(catalog.runtimes);
       setProviders(catalog.providers);
