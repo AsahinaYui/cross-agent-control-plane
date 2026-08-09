@@ -121,6 +121,23 @@ button {
   gap: 12px;
   cursor: grab;
 }
+
+.live-route-alert {
+  position: fixed;
+  top: 76px;
+  left: 50%;
+  z-index: 30;
+  max-width: min(620px, calc(100vw - 48px));
+  transform: translateX(-50%);
+  border: 1px solid rgb(251 113 133 / 55%);
+  border-radius: 16px;
+  background: rgb(55 10 24 / 88%);
+  box-shadow: 0 16px 42px rgb(0 0 0 / 30%);
+  color: #ffe4e8;
+  padding: 10px 16px;
+  font-size: 13px;
+  line-height: 1.45;
+}
 .mission-pill:active,
 .model-card:active,
 .status-strip:active {
@@ -499,6 +516,31 @@ button {
 .add-button:hover {
   background: rgba(243, 247, 255, 0.2);
 }
+.status-strip .execution-state {
+  min-width: 104px;
+}
+.execution-state.disabled strong,
+.execution-state.stopped strong {
+  color: #ff788f;
+}
+.execution-state.standby strong {
+  color: #f7cc70;
+}
+.execution-state.stopping strong {
+  color: #f7a970;
+}
+.execution-state.running strong,
+.execution-state.completed strong {
+  color: #69edb5;
+}
+.status-strip .stop-task-button {
+  border-color: rgba(255, 120, 143, 0.42);
+  color: #ff9aac;
+}
+.status-strip button:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
 
 .settings-panel {
   position: absolute;
@@ -647,9 +689,10 @@ select option {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: rgba(234, 239, 250, 0.28);
+  background: #ff657f;
+  box-shadow: 0 0 9px rgba(255, 72, 105, 0.72);
 }
-.provider-light.available {
+.provider-light.connected {
   background: #69edb5;
   box-shadow: 0 0 9px rgba(69, 232, 164, 0.8);
 }

@@ -15,6 +15,7 @@ import { buildProviderCatalog } from "./control-plane-provider-catalog.mjs";
 import {
   applyOverlayFocusability,
   createOverlayWindowOptions,
+  shouldOverlayCapturePointer,
 } from "./control-plane-overlay-window.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -25,6 +26,10 @@ let overlayWindow = null;
 let tray = null;
 let ownedBackend = null;
 let pinned = true;
+let editingMode = false;
+let hitRegions = [];
+let mouseIgnored = null;
+let hitTestTimer = null;
 
 app.setName("Cross Agent Overlay");
 
@@ -74,6 +79,7 @@ function createOverlayWindow() {
   overlayWindow.setAlwaysOnTop(true, "floating");
   overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   overlayWindow.setMenuBarVisibility(false);
+  setOverlayMouseIgnored(true);
 
   const devUrl = process.env.CONTROL_PLANE_OVERLAY_DEV_URL;
   if (devUrl) overlayWindow.loadURL(devUrl);
@@ -85,7 +91,37 @@ function createOverlayWindow() {
   overlayWindow.once("ready-to-show", () => overlayWindow?.showInactive());
   overlayWindow.on("closed", () => {
     overlayWindow = null;
+    mouseIgnored = null;
   });
+}
+
+function setOverlayMouseIgnored(ignored) {
+  if (!overlayWindow || overlayWindow.isDestroyed() || mouseIgnored === ignored)
+    return;
+  mouseIgnored = ignored;
+  overlayWindow.setIgnoreMouseEvents(ignored, { forward: true });
+}
+
+function syncOverlayMouseCapture() {
+  if (
+    !overlayWindow ||
+    overlayWindow.isDestroyed() ||
+    !overlayWindow.isVisible()
+  )
+    return;
+  const capture = shouldOverlayCapturePointer({
+    editing: editingMode,
+    windowBounds: overlayWindow.getBounds(),
+    cursor: screen.getCursorScreenPoint(),
+    hitRegions,
+  });
+  setOverlayMouseIgnored(!capture);
+}
+
+function startOverlayHitTesting() {
+  if (hitTestTimer) return;
+  hitTestTimer = setInterval(syncOverlayMouseCapture, 32);
+  hitTestTimer.unref?.();
 }
 
 function createTray() {
@@ -96,7 +132,7 @@ function createTray() {
   tray.setToolTip("Cross Agent Overlay");
   tray.setContextMenu(
     Menu.buildFromTemplate([
-      { label: "显示悬浮层", click: () => overlayWindow?.show() },
+      { label: "显示悬浮层", click: () => overlayWindow?.showInactive() },
       { label: "隐藏悬浮层", click: () => overlayWindow?.hide() },
       { type: "separator" },
       { label: "退出", click: () => app.quit() },
@@ -105,7 +141,7 @@ function createTray() {
   tray.on("click", () => {
     if (!overlayWindow) return;
     if (overlayWindow.isVisible()) overlayWindow.hide();
-    else overlayWindow.show();
+    else overlayWindow.showInactive();
   });
 }
 
@@ -147,12 +183,38 @@ ipcMain.handle("overlay:detect-providers", (event) => {
 
 ipcMain.on("overlay:set-interactive", (event, interactive) => {
   if (!isOverlaySender(event) || !overlayWindow) return;
-  overlayWindow.setIgnoreMouseEvents(!interactive, { forward: true });
+  setOverlayMouseIgnored(!interactive);
+});
+
+ipcMain.on("overlay:set-hit-regions", (event, regions) => {
+  if (!isOverlaySender(event) || !Array.isArray(regions)) return;
+  hitRegions = regions
+    .slice(0, 128)
+    .filter(
+      (region) =>
+        region &&
+        [region.x, region.y, region.width, region.height].every(
+          Number.isFinite,
+        ) &&
+        region.width > 0 &&
+        region.height > 0,
+    )
+    .map(({ x, y, width, height }) => ({ x, y, width, height }));
+  syncOverlayMouseCapture();
 });
 
 ipcMain.on("overlay:set-focusable", (event, focusable) => {
   if (!isOverlaySender(event) || !overlayWindow) return;
-  applyOverlayFocusability(overlayWindow, Boolean(focusable));
+  const nextFocusable = Boolean(focusable);
+  editingMode = nextFocusable;
+  if (!nextFocusable) {
+    // A full-work-area transparent window must stop consuming mouse input
+    // before it releases focus. Otherwise the stationary click immediately
+    // after closing settings is swallowed by the overlay.
+    setOverlayMouseIgnored(true);
+  }
+  applyOverlayFocusability(overlayWindow, nextFocusable);
+  syncOverlayMouseCapture();
 });
 
 ipcMain.handle("overlay:toggle-pin", (event) => {
@@ -174,11 +236,12 @@ app.whenReady().then(async () => {
     app.setAppUserModelId("cross.agent.control-plane.overlay");
   await ensureBackend();
   createOverlayWindow();
+  startOverlayHitTesting();
   createTray();
 });
 
 app.on("activate", () => {
-  if (overlayWindow) overlayWindow.show();
+  if (overlayWindow) overlayWindow.showInactive();
   else createOverlayWindow();
 });
 
@@ -187,6 +250,8 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  if (hitTestTimer) clearInterval(hitTestTimer);
+  hitTestTimer = null;
   tray?.destroy();
   tray = null;
   if (ownedBackend && !ownedBackend.killed) ownedBackend.kill();

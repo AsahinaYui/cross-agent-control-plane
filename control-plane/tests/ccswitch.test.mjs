@@ -1,9 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readFileSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { CcSwitchProviderResolver, readCcSwitchCatalog } from "../ccswitch.mjs";
+import {
+  CcSwitchProviderResolver,
+  isolateCodexRouteConfig,
+  readCcSwitchCatalog,
+} from "../ccswitch.mjs";
 import { tempDir } from "./helpers.mjs";
 
 function fixtureDatabase(root) {
@@ -68,8 +78,13 @@ function fixtureDatabase(root) {
     "codex",
     "Codex Route",
     JSON.stringify({
-      auth: { OPENAI_API_KEY: "codex-secret" },
-      config: 'model_provider = "custom"\nmodel = "gpt-route"\n',
+      auth: {
+        auth_mode: "chatgpt",
+        OPENAI_API_KEY: "codex-secret",
+        tokens: { access_token: "native-session-token" },
+      },
+      config:
+        'model_provider = "custom"\nmodel = "gpt-route"\nbase_url = "https://custom.example/v1"\n',
       modelCatalog: { models: [{ model: "gpt-route" }] },
     }),
     1,
@@ -79,19 +94,65 @@ function fixtureDatabase(root) {
     null,
     null,
   );
+  insert.run(
+    "claude-no-auth",
+    "claude",
+    "Claude Without Auth",
+    JSON.stringify({
+      env: {
+        ANTHROPIC_MODEL: "claude-test",
+      },
+    }),
+    3,
+    0,
+    null,
+    "1.0",
+    null,
+    null,
+  );
   db.close();
   return path;
 }
+
+test("Codex runtime snapshots exclude Desktop integrations", () => {
+  const config = isolateCodexRouteConfig(`
+model = "deepseek-v4-flash"
+base_url = "https://api.example.test"
+wire_api = "responses"
+model_catalog_json = "cc-switch-model-catalog.json"
+notify = ["desktop-notifier"]
+
+[mcp_servers.codegraph]
+command = "codegraph"
+
+[plugins.browser]
+enabled = true
+`);
+  assert.match(config, /model = "deepseek-v4-flash"/);
+  assert.match(config, /base_url = "https:\/\/api\.example\.test\/v1"/);
+  assert.match(config, /model_provider = "ccswitch"/);
+  assert.match(config, /\[model_providers\.ccswitch\]/);
+  assert.match(config, /\[features\][\s\S]*plugins = false/);
+  assert.doesNotMatch(config, /notify|mcp_servers|\[plugins\./);
+});
 
 test("ccSwitch catalog contains safe route metadata without credentials", () => {
   const root = tempDir("ccswitch-catalog"),
     dbPath = fixtureDatabase(root),
     catalog = readCcSwitchCatalog({ dbPath });
-  assert.equal(catalog.length, 3);
+  assert.equal(catalog.length, 4);
   assert.deepEqual(catalog[0].models, ["deepseek-v4-flash"]);
   assert.equal(catalog[0].runtimeIds[0], "claude-cli");
   assert.equal(JSON.stringify(catalog).includes("secret-a"), false);
   assert.match(catalog[0].configHash, /^sha256:/);
+  assert.equal(
+    catalog.find((item) => item.id === "deepseek-a").credentialReady,
+    true,
+  );
+  assert.equal(
+    catalog.find((item) => item.id === "claude-no-auth").credentialReady,
+    false,
+  );
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -156,10 +217,96 @@ test("Codex routes receive a per-run CODEX_HOME snapshot", () => {
     readFileSync(join(launch.env.CODEX_HOME, "config.toml"), "utf8"),
     /model_provider = "custom"/,
   );
-  assert.equal(
-    JSON.parse(readFileSync(join(launch.env.CODEX_HOME, "auth.json"), "utf8"))
-      .OPENAI_API_KEY,
-    "codex-secret",
+  const auth = JSON.parse(
+    readFileSync(join(launch.env.CODEX_HOME, "auth.json"), "utf8"),
   );
+  assert.deepEqual(auth, {
+    auth_mode: "apikey",
+    OPENAI_API_KEY: "codex-secret",
+  });
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("Codex snapshots include a relative ccSwitch model catalog", () => {
+  const root = tempDir("ccswitch-codex-catalog"),
+    dbPath = fixtureDatabase(root),
+    sourceRoot = join(root, "codex-source"),
+    runtimeConfigRoot = join(root, "runtime-configs"),
+    db = new DatabaseSync(dbPath),
+    settings = JSON.parse(
+      db
+        .prepare(
+          "SELECT settings_config FROM providers WHERE app_type='codex' AND id='codex-route'",
+        )
+        .get().settings_config,
+    );
+  mkdirSync(sourceRoot, { recursive: true });
+  writeFileSync(
+    join(sourceRoot, "cc-switch-model-catalog.json"),
+    '{"models":[]}',
+  );
+  settings.config += 'model_catalog_json = "cc-switch-model-catalog.json"\n';
+  db.prepare(
+    "UPDATE providers SET settings_config=? WHERE app_type='codex' AND id='codex-route'",
+  ).run(JSON.stringify(settings));
+  db.close();
+  const route = readCcSwitchCatalog({ dbPath }).find(
+      (item) => item.id === "codex-route",
+    ),
+    resolver = new CcSwitchProviderResolver({
+      dbPath,
+      runtimeConfigRoot,
+      codexSourceRoots: [sourceRoot],
+    }),
+    launch = resolver.resolve(
+      {
+        runtime_id: "codex-cli",
+        provider_source: "ccswitch",
+        ccswitch_app_type: "codex",
+        provider_id: route.id,
+        provider_config_hash: route.configHash,
+        model_id: "gpt-route",
+      },
+      { runId: "run-codex-catalog" },
+    );
+  assert.equal(
+    readFileSync(
+      join(launch.env.CODEX_HOME, "cc-switch-model-catalog.json"),
+      "utf8",
+    ),
+    '{"models":[]}',
+  );
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("reused AgentSessions retain one isolated runtime home across stages", () => {
+  const root = tempDir("ccswitch-session"),
+    dbPath = fixtureDatabase(root),
+    runtimeConfigRoot = join(root, "runtime-configs"),
+    resolver = new CcSwitchProviderResolver({ dbPath, runtimeConfigRoot }),
+    route = readCcSwitchCatalog({ dbPath }).find(
+      (item) => item.id === "codex-route",
+    ),
+    profile = {
+      runtime_id: "codex-cli",
+      provider_source: "ccswitch",
+      ccswitch_app_type: "codex",
+      provider_id: route.id,
+      provider_config_hash: route.configHash,
+      model_id: "gpt-route",
+    },
+    first = resolver.resolve(profile, {
+      runId: "direction-run",
+      sessionId: "shared-agent",
+    }),
+    second = resolver.resolve(profile, {
+      runId: "audit-run",
+      sessionId: "shared-agent",
+    });
+  assert.equal(first.env.CODEX_HOME, second.env.CODEX_HOME);
+  resolver.cleanup("direction-run");
+  assert.equal(existsSync(first.env.CODEX_HOME), true);
+  resolver.cleanupSession("shared-agent");
+  assert.equal(existsSync(first.env.CODEX_HOME), false);
   rmSync(root, { recursive: true, force: true });
 });

@@ -17,6 +17,8 @@ test("Claude and Codex adapters normalize their own fixtures without changing co
     codex = createRuntimeAdapter("codex-cli");
   assert.equal((await claude.describe()).capabilities.structured_events, true);
   assert.equal((await codex.describe()).capabilities.structured_events, true);
+  assert.equal((await claude.describe()).capabilities.resume_session, true);
+  assert.equal((await codex.describe()).capabilities.resume_session, true);
   const cInit = claude.normalize({
     type: "system",
     subtype: "init",
@@ -24,6 +26,15 @@ test("Claude and Codex adapters normalize their own fixtures without changing co
   });
   assert.equal(cInit.event.type, "model.observed");
   assert.equal(cInit.actual_model, "claude-fixture");
+  assert.equal(
+    claude.normalize({
+      type: "system",
+      subtype: "init",
+      model: "claude-fixture",
+      session_id: "claude-session",
+    }).external_session_id,
+    "claude-session",
+  );
   assert.equal(
     claude.normalize({ type: "result", subtype: "success", is_error: false })
       .terminal.completed,
@@ -34,6 +45,18 @@ test("Claude and Codex adapters normalize their own fixtures without changing co
     item: { type: "agent_message", text: "done" },
   });
   assert.deepEqual(xMessage.event.data, { channel: "progress", text: "done" });
+  assert.equal(
+    codex.normalize({ type: "thread.started", thread_id: "codex-session" })
+      .external_session_id,
+    "codex-session",
+  );
+  assert.equal(
+    codex.normalize(
+      { type: "thread.started", thread_id: "codex-session" },
+      { requested_model: "deepseek-v4-flash" },
+    ).actual_model,
+    "deepseek-v4-flash",
+  );
   assert.equal(
     codex.normalize({ type: "turn.completed" }).terminal.completed,
     true,
@@ -48,19 +71,47 @@ test("read-only assignments use runtime-enforced read-only modes", () => {
   };
   const codex = buildCodexCommand(input),
     claude = buildClaudeCommand(input);
+  assert.equal(codex.includes("--ask-for-approval"), false);
   assert.equal(codex[codex.indexOf("--sandbox") + 1], "read-only");
   assert.equal(claude[claude.indexOf("--permission-mode") + 1], "plan");
   assert.equal(
     buildCodexCommand({ ...input, write_intent: true })[
       codex.indexOf("--sandbox") + 1
     ],
-    "workspace-write",
+    process.platform === "win32" ? "danger-full-access" : "workspace-write",
   );
   assert.equal(
     buildClaudeCommand({ ...input, write_intent: true })[
       claude.indexOf("--permission-mode") + 1
     ],
     "dontAsk",
+  );
+  const resumedCodex = buildCodexCommand({
+      ...input,
+      resume_session_id: "codex-session",
+    }),
+    resumedClaude = buildClaudeCommand({
+      ...input,
+      resume_session_id: "claude-session",
+    });
+  assert.deepEqual(
+    resumedCodex.slice(
+      resumedCodex.indexOf("exec"),
+      resumedCodex.indexOf("exec") + 2,
+    ),
+    ["exec", "resume"],
+  );
+  assert.equal(
+    resumedCodex[resumedCodex.indexOf("--sandbox") + 1],
+    "read-only",
+  );
+  assert.equal(
+    resumedCodex[resumedCodex.indexOf("codex-session")],
+    "codex-session",
+  );
+  assert.equal(
+    resumedClaude[resumedClaude.indexOf("--resume") + 1],
+    "claude-session",
   );
 });
 

@@ -124,7 +124,7 @@ export function createControlPlaneServer({
         parts[4] &&
         parts[5] === "close"
       )
-        return json(res, 200, store.closeSession(parts[4]));
+        return json(res, 200, orchestrator.closeSession(parts[4]));
       if (
         req.method === "GET" &&
         parts[1] === "tasks" &&

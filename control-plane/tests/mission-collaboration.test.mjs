@@ -55,6 +55,16 @@ test("execution plans pin profiles and assignments retain their plan snapshot", 
       session_id: session.session_id,
       prompt: "Implement the task",
     });
+  store.updateSessionExternalId(session.session_id, "external-session-1");
+  assert.equal(
+    store.getSession(session.session_id).external_session_id,
+    "external-session-1",
+  );
+  assert.throws(
+    () =>
+      store.updateSessionExternalId(session.session_id, "different-session"),
+    /external identity changed/,
+  );
   assert.equal(first.revision, 1);
   assert.equal(first.coordinator_surface, "codex-desktop");
   assert.equal(
@@ -94,9 +104,26 @@ test("assignment runs reuse one mission worktree and enforce leases", async () =
     state = tempDir("mission-shared-worktree"),
     store = new ControlPlaneStore(state),
     task = store.createTask(taskInput(repository.head)),
+    starts = [],
     orchestrator = new ControlPlaneOrchestrator({
       store,
       worktreesRoot: join(state, "worktrees"),
+      runtimeAdapterFactory(runtimeId) {
+        const adapter = createRuntimeAdapter(runtimeId),
+          start = adapter.start.bind(adapter),
+          normalize = adapter.normalize.bind(adapter);
+        adapter.start = (input, sinks) => {
+          starts.push(structuredClone(input));
+          return start(input, sinks);
+        };
+        adapter.normalize = (parsed) => ({
+          ...normalize(parsed),
+          ...(parsed.type === "model.observed"
+            ? { external_session_id: "fake-external-session" }
+            : {}),
+        });
+        return adapter;
+      },
     });
   store.createExecutionPlan(task.task_id, planInput());
   const coordinator = store.attachSession(task.task_id, {
@@ -155,6 +182,11 @@ test("assignment runs reuse one mission worktree and enforce leases", async () =
     "completed",
   );
   assert.equal(store.getLease(task.task_id, "workspace_write"), null);
+  assert.equal(starts[0].resume_session_id, null);
+  assert.equal(
+    store.getSession(worker.session_id).external_session_id,
+    "fake-external-session",
+  );
 
   const secondAssignment = store.createAssignment(task.task_id, {
       stage_id: "implementation",
@@ -166,6 +198,7 @@ test("assignment runs reuse one mission worktree and enforce leases", async () =
       repositoryRoot: repository.root,
     }),
     secondRun = await second.completion;
+  assert.equal(starts[1].resume_session_id, "fake-external-session");
   assert.equal(secondRun.state, "completed");
   assert.equal(
     secondRun.worktree_path,

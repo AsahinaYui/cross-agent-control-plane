@@ -6,6 +6,8 @@ export interface ProviderOption {
   appType: "claude" | "codex";
   label: string;
   available: boolean;
+  connected: boolean;
+  credentialReady: boolean;
   channel: "subscription" | "external-api" | "local-cli";
   current: boolean;
   configured: boolean;
@@ -26,6 +28,7 @@ export interface RuntimeOption {
 
 export interface ExecutionCatalog {
   source: "ccswitch";
+  liveTakeovers: Array<"claude" | "codex">;
   runtimes: RuntimeOption[];
   providers: ProviderOption[];
 }
@@ -54,6 +57,7 @@ export interface TaskSummary {
 
 export interface ActivityAssignment {
   assignment_id: string;
+  plan_revision?: number;
   stage_id: string;
   role: string;
   profile: {
@@ -132,6 +136,9 @@ export interface OverlayBridge {
   ): Promise<T>;
   detectProviders(): Promise<ExecutionCatalog>;
   setInteractive(interactive: boolean): void;
+  setHitRegions(
+    regions: Array<{ x: number; y: number; width: number; height: number }>,
+  ): void;
   setFocusable(focusable: boolean): void;
   togglePin(): Promise<boolean>;
   minimize(): void;

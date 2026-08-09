@@ -118,6 +118,7 @@ export function assertSessionMatchesProfile(session, profile) {
   if (!session || session.state !== "attached")
     throw new Error("Assignment requires an attached AgentSession");
   for (const key of [
+    "profile_id",
     "runtime_id",
     "provider_id",
     "model_id",

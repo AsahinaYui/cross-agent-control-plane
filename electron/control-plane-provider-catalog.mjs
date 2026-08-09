@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 import {
   defaultCcSwitchDbPath,
   readCcSwitchCatalog,
+  readCcSwitchLiveTakeovers,
 } from "../control-plane/ccswitch.mjs";
 
 const unique = (values) => [
@@ -42,6 +43,7 @@ export async function buildProviderCatalog({
   dbPath = defaultCcSwitchDbPath(userHome),
   hasCommand = commandAvailable,
   readCatalog = readCcSwitchCatalog,
+  readLiveTakeovers = readCcSwitchLiveTakeovers,
 } = {}) {
   const codexAvailable = hasCommand("codex");
   const claudeAvailable = hasCommand("claude");
@@ -71,6 +73,8 @@ export async function buildProviderCatalog({
     return {
       ...provider,
       available: provider.configured && runtimeAvailable,
+      connected:
+        provider.configured && provider.credentialReady && runtimeAvailable,
       channel: "external-api",
       models,
       hint: [
@@ -85,6 +89,7 @@ export async function buildProviderCatalog({
 
   return {
     source: "ccswitch",
+    liveTakeovers: readLiveTakeovers({ dbPath }),
     runtimes: [
       {
         id: "codex-cli",

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Control Plane Overlay — visual comparison</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; padding: 24px; color: #eef3ff; background: #101426; font-family: system-ui, sans-serif; }
+      h1 { margin: 0 0 20px; font-size: 20px; }
+      main { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; width: 100%; }
+      figure { min-width: 0; margin: 0; padding: 12px; overflow: hidden; border: 1px solid #303a56; border-radius: 16px; background: #181e32; }
+      figcaption { margin: 0 0 10px; color: #aebbd8; font-size: 13px; }
+      img { display: block; width: 100%; max-width: 100%; height: auto; border-radius: 10px; }
+    </style>
+  </head>
+  <body>
+    <h1>Standalone control-plane overlay — reference vs implementation</h1>
+    <main>
+      <figure><figcaption>Selected visual reference</figcaption><img src="reference.png" alt="Selected reference" /></figure>
+      <figure><figcaption>Implementation · same 1487 × 1058 viewport</figcaption><img src="implementation.png" alt="Implemented overlay" /></figure>
+    </main>
+  </body>
+</html>

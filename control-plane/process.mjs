@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { windowsSystemProxyEnvironment } from "./proxy.mjs";
 
 export function writeLease(path, value) {
   const temp=`${path}.${process.pid}.tmp`; writeFileSync(temp,`${JSON.stringify(value,null,2)}\n`,"utf8"); renameSync(temp,path);
@@ -16,12 +17,14 @@ export async function terminateProcessTree(child, graceMs=1500) {
   else { try { process.kill(-child.pid,"SIGKILL"); } catch { child.kill("SIGKILL"); } }
 }
 
-export function spawnOwnedProcess({argv,cwd,env,onStdout,onStderr}) {
+export function spawnOwnedProcess({argv,cwd,env,onStdout,onStderr,keepStdinOpen=false}) {
   if(!Array.isArray(argv)||!argv.length) throw new Error("argv must not be empty");
-  const child=spawn(argv[0],argv.slice(1),{cwd,env:{...process.env,...env},stdio:["pipe","pipe","pipe"],windowsHide:true,detached:process.platform!=="win32"});
+  const mergedEnv={...process.env,...env};
+  const child=spawn(argv[0],argv.slice(1),{cwd,env:{...mergedEnv,...windowsSystemProxyEnvironment(mergedEnv)},stdio:["pipe","pipe","pipe"],windowsHide:true,detached:process.platform!=="win32"});
   child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
   child.stdout.on("data",(chunk)=>onStdout?.(chunk)); child.stderr.on("data",(chunk)=>onStderr?.(chunk));
-  const completion=new Promise((resolve,reject)=>{child.once("error",reject);child.once("exit",(code,signal)=>resolve({exit_code:code,signal}));});
+  if(!keepStdinOpen) child.stdin.end();
+  const completion=new Promise((resolve,reject)=>{child.once("error",reject);child.once("close",(code,signal)=>resolve({exit_code:code,signal}));});
   return {child,completion,send:(message)=>child.stdin.write(`${message}\n`),cancel:()=>terminateProcessTree(child)};
 }
 

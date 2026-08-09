@@ -119,6 +119,7 @@ export class ControlPlaneOrchestrator {
       runtimeOptions,
       requestedModel,
       executable,
+      resumeSessionId,
     });
     active.completion = completion;
     void completion.finally(() => this.active.delete(runId)).catch(() => {});
@@ -169,7 +170,10 @@ export class ControlPlaneOrchestrator {
     try {
       runId = makeId("run");
       const providerLaunch = this.providerResolver
-          ? this.providerResolver.resolve(assignment.profile, { runId })
+          ? this.providerResolver.resolve(assignment.profile, {
+              runId,
+              sessionId: session.session_id,
+            })
           : { env: {}, route: null },
         run = this.store.createRun({
           run_id: runId,
@@ -184,6 +188,7 @@ export class ControlPlaneOrchestrator {
           expected_model: assignment.profile.model_id,
           execution_profile: assignment.profile,
           provider_route: providerLaunch.route,
+          resume_session_id: session.external_session_id,
           runtime_capabilities: descriptor.capabilities,
           assigned_actor: { kind: "session", id: session.session_id },
           assignment_id: assignmentId,
@@ -232,6 +237,8 @@ export class ControlPlaneOrchestrator {
         missionMode: true,
         runtimeEnv: providerLaunch.env,
         writeIntent: assignment.write_intent,
+        resumeSessionId: session.external_session_id,
+        sessionId: session.session_id,
       });
       active.completion = completion;
       void completion
@@ -311,9 +318,51 @@ export class ControlPlaneOrchestrator {
     missionMode = false,
     runtimeEnv = {},
     writeIntent = true,
+    resumeSessionId = null,
+    sessionId = null,
   }) {
     const raw = [],
       messages = [];
+    let credible = false,
+      actualModel = null,
+      lineNumber = 0;
+    const consumeLine = (stream, line) => {
+      if (!line) return;
+      lineNumber += 1;
+      if (stream !== "stdout") return;
+      let parsed;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        return;
+      }
+      const normalized = adapter.normalize(parsed, {
+        requested_model: requestedModel,
+      });
+      if (normalized.external_session_id && sessionId)
+        this.store.updateSessionExternalId(
+          sessionId,
+          normalized.external_session_id,
+        );
+      if (normalized.terminal) {
+        credible = normalized.terminal.completed === true;
+        return;
+      }
+      if (normalized.actual_model) actualModel = normalized.actual_model;
+      if (!normalized.event) return;
+      if (normalized.event.type === "agent.message")
+        messages.push(normalized.event.data?.text ?? normalized.event.summary);
+      this.store.appendEvent(runId, {
+        actor,
+        source: { kind: "runtime", raw_offset: { line: lineNumber } },
+        normalizer: {
+          name: adapter.runtimeId,
+          version: adapter.adapterVersion,
+        },
+        ...normalized.event,
+        extensions: { [adapter.runtimeId]: parsed },
+      });
+    };
     try {
       const handle = await adapter.start(
         {
@@ -324,8 +373,12 @@ export class ControlPlaneOrchestrator {
           executable,
           env: runtimeEnv,
           write_intent: writeIntent,
+          resume_session_id: resumeSessionId,
         },
-        { raw: (stream, chunk) => raw.push({ stream, chunk }), line: () => {} },
+        {
+          raw: (stream, chunk) => raw.push({ stream, chunk }),
+          line: consumeLine,
+        },
       );
       const active = this.active.get(runId);
       if (!active) throw new Error(`Run lost active state: ${runId}`);
@@ -353,51 +406,13 @@ export class ControlPlaneOrchestrator {
       const result = await adapter.wait(handle);
       if (timer) clearTimeout(timer);
       const rawText = raw.map((x) => `[${x.stream}] ${x.chunk}`).join("");
-      const rawArtifact = this.store.createArtifact(runId, {
+      this.store.createArtifact(runId, {
         kind: "runtime_raw_events",
         media_type: "application/x-ndjson",
         source: "runtime",
         data: rawText,
         extension: "ndjson",
       });
-      let credible = false,
-        actualModel = null,
-        lineNumber = 0;
-      for (const entry of raw)
-        for (const line of entry.chunk.split(/\r?\n/).filter(Boolean)) {
-          lineNumber += 1;
-          let parsed;
-          try {
-            parsed = JSON.parse(line);
-          } catch {
-            continue;
-          }
-          const normalized = adapter.normalize(parsed);
-          if (normalized.terminal) {
-            credible = normalized.terminal.completed === true;
-            continue;
-          }
-          if (normalized.actual_model) actualModel = normalized.actual_model;
-          if (!normalized.event) continue;
-          if (normalized.event.type === "agent.message")
-            messages.push(
-              normalized.event.data?.text ?? normalized.event.summary,
-            );
-          this.store.appendEvent(runId, {
-            actor,
-            source: {
-              kind: "runtime",
-              raw_artifact_id: rawArtifact.artifact_id,
-              raw_offset: { line: lineNumber },
-            },
-            normalizer: {
-              name: adapter.runtimeId,
-              version: adapter.adapterVersion,
-            },
-            ...normalized.event,
-            extensions: { [adapter.runtimeId]: parsed },
-          });
-        }
       const current = this.store.getRun(runId);
       if (current.state === "cancel_requested") {
         this.store.transitionRun(runId, "canceled", {
@@ -575,6 +590,11 @@ export class ControlPlaneOrchestrator {
       reason_code: "user_requested",
     });
     if (active.handle) await active.adapter.cancel(active.handle);
+  }
+  closeSession(sessionId) {
+    const session = this.store.closeSession(sessionId);
+    this.providerResolver?.cleanupSession?.(sessionId);
+    return session;
   }
   async reconcile() {
     const repaired = [];

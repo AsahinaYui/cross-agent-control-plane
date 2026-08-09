@@ -4,6 +4,7 @@ import type {
   TaskActivity,
   TaskSummary,
 } from "./types";
+import { agentProfileIds } from "./agent-identity";
 
 const API_BASE = "http://127.0.0.1:18002/v1";
 
@@ -40,6 +41,7 @@ export async function saveExecutionPlan(
   currentPlanRevision: number,
   coordinatorSurface: string,
 ) {
+  const profileIds = agentProfileIds(modules);
   return request(`/tasks/${encodeURIComponent(taskId)}/execution-plan`, {
     method: "POST",
     body: {
@@ -62,7 +64,7 @@ export async function saveExecutionPlan(
           module.responsibility.trim() || module.role.trim() || "Worker",
         write_intent: module.writeIntent,
         profile: {
-          profile_id: module.id,
+          profile_id: profileIds[index],
           runtime_id: module.runtimeId,
           provider_id: module.providerId,
           provider_source: "ccswitch",
@@ -77,8 +79,15 @@ export async function saveExecutionPlan(
   });
 }
 
+export async function cancelRun(runId: string) {
+  return request(`/runs/${encodeURIComponent(runId)}/cancel`, {
+    method: "POST",
+  });
+}
+
 const browserCatalog: ExecutionCatalog = {
   source: "ccswitch",
+  liveTakeovers: [],
   runtimes: [
     {
       id: "codex-cli",
@@ -102,6 +111,8 @@ const browserCatalog: ExecutionCatalog = {
       appType: "codex",
       label: "OpenAI · ccSwitch",
       available: true,
+      connected: true,
+      credentialReady: true,
       channel: "external-api",
       current: true,
       configured: true,
@@ -117,6 +128,8 @@ const browserCatalog: ExecutionCatalog = {
       appType: "claude",
       label: "DeepSeek · ccSwitch",
       available: true,
+      connected: true,
+      credentialReady: true,
       channel: "external-api",
       current: true,
       configured: true,

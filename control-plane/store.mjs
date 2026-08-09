@@ -256,6 +256,36 @@ export class ControlPlaneStore {
       .run(session.updated_at, session.last_seen_at, sessionId);
     return session;
   }
+  updateSessionExternalId(sessionId, externalSessionId) {
+    const session = this.getSession(sessionId);
+    if (!session || session.state !== "attached")
+      throw new Error(`Unknown attached AgentSession: ${sessionId}`);
+    if (typeof externalSessionId !== "string" || !externalSessionId.trim())
+      throw new Error("externalSessionId must be a non-empty string");
+    if (
+      session.external_session_id &&
+      session.external_session_id !== externalSessionId
+    )
+      throw new Error(
+        `AgentSession external identity changed: expected=${session.external_session_id}, actual=${externalSessionId}`,
+      );
+    session.external_session_id = externalSessionId;
+    session.last_seen_at = nowIso();
+    session.updated_at = session.last_seen_at;
+    const path = childPath(this.sessionsRoot, `${sessionId}.json`);
+    atomicJson(path, session);
+    this.db
+      .prepare(
+        "UPDATE agent_sessions SET external_session_id=?,updated_at=?,last_seen_at=? WHERE session_id=?",
+      )
+      .run(
+        session.external_session_id,
+        session.updated_at,
+        session.last_seen_at,
+        sessionId,
+      );
+    return session;
+  }
   closeSession(sessionId) {
     const session = this.getSession(sessionId);
     if (!session) throw new Error(`Unknown AgentSession: ${sessionId}`);

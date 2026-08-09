@@ -20,6 +20,7 @@ import {
   Pin,
   PinOff,
   Plus,
+  Power,
   Save,
   Settings,
   Sparkles,
@@ -29,12 +30,15 @@ import {
 } from "lucide-react";
 import { SiAnthropic, SiOpenai } from "react-icons/si";
 import deepseekLogo from "./assets/deepseek.svg";
+import { agentReuseLabel, uniqueAgentCount } from "./agent-identity";
 import {
+  cancelRun,
   detectProviders,
   getTaskActivity,
   listTasks,
   saveExecutionPlan,
 } from "./api";
+import { taskExecutionState } from "./task-execution-state";
 import type {
   ActivityAssignment,
   ExecutionCatalog,
@@ -552,12 +556,19 @@ function SettingsPanel({
         item.appType === module.providerAppType,
     );
     return Boolean(
-      provider?.available &&
+      provider?.connected &&
       provider.configHash === module.providerConfigHash &&
       provider.runtimeIds.includes(module.runtimeId) &&
       module.modelId.trim(),
     );
   });
+  const saveDisabledReason = !selectedTaskId
+    ? "请先选择当前任务"
+    : !planReady
+      ? "请先修正不可用的 Runtime、Provider 或模型配置"
+      : saving
+        ? "正在保存"
+        : undefined;
   const add = () => {
     const runtime = runtimes.find((item) => item.available) ?? runtimes[0];
     const provider =
@@ -589,6 +600,7 @@ function SettingsPanel({
       {open ? (
         <motion.aside
           data-overlay-hit
+          data-overlay-settings
           className="settings-panel"
           initial={{ opacity: 0, scale: 0.9, x: 48 }}
           animate={{ opacity: 1, scale: 1, x: 0 }}
@@ -636,6 +648,7 @@ function SettingsPanel({
                   onChange={(event) => onSurface(event.target.value)}
                 >
                   <option value="codex-desktop">Codex Desktop</option>
+                  <option value="codex-cli">Codex CLI</option>
                   <option value="claude-desktop">Claude Desktop</option>
                   <option value="openhands">OpenHands</option>
                   <option value="cursor">Cursor</option>
@@ -653,6 +666,26 @@ function SettingsPanel({
                   item.id === module.providerId &&
                   item.appType === module.providerAppType,
               );
+              const moduleConnected = Boolean(
+                provider?.connected &&
+                provider.configHash === module.providerConfigHash &&
+                provider.runtimeIds.includes(module.runtimeId) &&
+                module.modelId.trim(),
+              );
+              const reuseLabel = agentReuseLabel(modules, index);
+              const connectionLabel = !provider
+                ? "未接通：未找到 ccSwitch 路由"
+                : !provider.available
+                  ? "未接通：Runtime 不可用或路由配置缺失"
+                  : !provider.credentialReady
+                    ? "未接通：ccSwitch 路由缺少认证材料"
+                    : provider.configHash !== module.providerConfigHash
+                      ? "未接通：固定路由已变化，请重新选择"
+                      : !provider.runtimeIds.includes(module.runtimeId)
+                        ? "未接通：Runtime 与路由不兼容"
+                        : !module.modelId.trim()
+                          ? "未接通：尚未选择模型"
+                          : "已接通";
               const compatibleProviders = providers.filter((item) =>
                 item.runtimeIds.includes(module.runtimeId),
               );
@@ -665,7 +698,9 @@ function SettingsPanel({
                 <div className="model-editor" key={module.id}>
                   <div className="editor-line">
                     <span
-                      className={`provider-light ${provider?.available ? "available" : ""}`}
+                      className={`provider-light ${moduleConnected ? "connected" : "disconnected"}`}
+                      title={connectionLabel}
+                      aria-label={connectionLabel}
                     />
                     <select
                       value={module.runtimeId}
@@ -768,7 +803,10 @@ function SettingsPanel({
                       ? "ccSwitch 路线配置已变化，请重新选择该 Provider"
                       : (provider?.hint ?? "未检测到兼容的 ccSwitch 路线")}
                     {" · "}
-                    {module.runtimeId} 独立实例
+                    {module.runtimeId}
+                    {reuseLabel
+                      ? ` · ${reuseLabel}（共享会话）`
+                      : " · 独立 Agent"}
                   </div>
                   <div className="editor-line lower">
                     <input
@@ -809,13 +847,14 @@ function SettingsPanel({
               className="save-button"
               onClick={onSave}
               disabled={!selectedTaskId || saving || !planReady}
+              title={saveDisabledReason}
             >
               {saving ? (
                 <LoaderCircle className="spin" size={16} />
               ) : (
                 <Save size={16} />
               )}{" "}
-              固定 Execution Plan
+              {!selectedTaskId ? "请先选择任务" : "固定 Execution Plan"}
             </button>
           </div>
         </motion.aside>
@@ -851,8 +890,11 @@ function OverlayApp() {
   const [pinned, setPinned] = useState(true);
   const [connection, setConnection] = useState(preview ? "已连接" : "正在连接");
   const [saving, setSaving] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [notice, setNotice] = useState("");
-  const interactiveRef = useRef(true);
+  const [liveTakeovers, setLiveTakeovers] = useState<Array<"claude" | "codex">>(
+    [],
+  );
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(modules));
@@ -867,14 +909,27 @@ function OverlayApp() {
   }, [coordinatorSurface]);
 
   useEffect(() => {
-    window.controlPlaneOverlay?.setFocusable(settingsOpen);
-    return () => window.controlPlaneOverlay?.setFocusable(false);
+    if (settingsOpen) {
+      window.controlPlaneOverlay?.setFocusable(true);
+      return;
+    }
+
+    window.controlPlaneOverlay?.setFocusable(false);
   }, [settingsOpen]);
+
+  useEffect(
+    () => () => {
+      window.controlPlaneOverlay?.setHitRegions([]);
+      window.controlPlaneOverlay?.setFocusable(false);
+    },
+    [],
+  );
 
   useEffect(() => {
     void detectProviders().then((catalog) => {
       setRuntimes(catalog.runtimes);
       setProviders(catalog.providers);
+      setLiveTakeovers(catalog.liveTakeovers ?? []);
       setModules((current) => reconcileModules(current, catalog));
     });
     if (preview) return;
@@ -905,6 +960,7 @@ function OverlayApp() {
       void detectProviders().then((catalog) => {
         setRuntimes(catalog.runtimes);
         setProviders(catalog.providers);
+        setLiveTakeovers(catalog.liveTakeovers ?? []);
         setModules((current) => reconcileModules(current, catalog));
       });
   }, [settingsOpen]);
@@ -933,22 +989,54 @@ function OverlayApp() {
 
   useEffect(() => {
     if (!window.controlPlaneOverlay) return;
-    const onMove = (event: PointerEvent) => {
-      const target = event.target as Element | null;
-      const interactive = Boolean(target?.closest("[data-overlay-hit]"));
-      if (interactiveRef.current !== interactive) {
-        interactiveRef.current = interactive;
-        window.controlPlaneOverlay?.setInteractive(interactive);
-      }
+    let frame = 0;
+    const publish = () => {
+      frame = 0;
+      const regions = Array.from(
+        document.querySelectorAll<HTMLElement>("[data-overlay-hit]"),
+      )
+        .filter((element) => !element.closest("[data-overlay-settings]"))
+        .map((element) => {
+          const rect = element.getBoundingClientRect();
+          return {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+          };
+        })
+        .filter((region) => region.width > 0 && region.height > 0);
+      window.controlPlaneOverlay?.setHitRegions(regions);
     };
-    window.addEventListener("pointermove", onMove);
-    return () => window.removeEventListener("pointermove", onMove);
+    const schedule = () => {
+      if (!frame) frame = window.requestAnimationFrame(publish);
+    };
+    const observer = new MutationObserver(schedule);
+    observer.observe(document.body, {
+      attributes: true,
+      attributeFilter: ["class", "style"],
+      childList: true,
+      subtree: true,
+    });
+    const resizeObserver = new ResizeObserver(schedule);
+    resizeObserver.observe(document.body);
+    window.addEventListener("resize", schedule);
+    schedule();
+    return () => {
+      observer.disconnect();
+      resizeObserver.disconnect();
+      window.removeEventListener("resize", schedule);
+      if (frame) window.cancelAnimationFrame(frame);
+      window.controlPlaneOverlay?.setHitRegions([]);
+    };
   }, []);
 
   const task = useMemo(
     () => tasks.find((item) => item.task_id === selectedTaskId),
     [selectedTaskId, tasks],
   );
+  const execution = taskExecutionState(activity);
+  const agents = uniqueAgentCount(modules);
   const completed =
     activity?.assignments.filter((item) => item.state === "completed").length ??
     0;
@@ -986,6 +1074,23 @@ function OverlayApp() {
     }
   };
 
+  const stopTask = async () => {
+    if (execution.activeRunIds.length === 0) return;
+    setStopping(true);
+    try {
+      await Promise.all(
+        execution.activeRunIds.map((runId) => cancelRun(runId)),
+      );
+      if (task) setActivity(await getTaskActivity(task.task_id));
+      setNotice("已请求停止当前任务");
+      window.setTimeout(() => setNotice(""), 3200);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "停止任务失败");
+    } finally {
+      setStopping(false);
+    }
+  };
+
   return (
     <main
       className={`overlay-canvas ${preview ? "preview-desktop" : ""} ${darkMode ? "theme-dark" : "theme-clear"}`}
@@ -1009,6 +1114,13 @@ function OverlayApp() {
           {connection}
         </span>
       </motion.div>
+
+      {liveTakeovers.includes("codex") ? (
+        <div data-overlay-hit className="live-route-alert" role="alert">
+          ccSwitch 正在接管 Codex Live，会影响当前 Codex Desktop 会话。子 Agent
+          不需要开启 Live 代理。
+        </div>
+      ) : null}
 
       <div data-overlay-hit className="orb-stack">
         <button
@@ -1080,10 +1192,40 @@ function OverlayApp() {
         </div>
         <div>
           <CirclePlus size={15} />
-          <strong>{modules.length}</strong>
-          <small>固定模型</small>
+          <strong>{agents}</strong>
+          <small>Agent 实例</small>
         </div>
-        <button onClick={() => setSettingsOpen(true)}>
+        <div
+          className={`execution-state ${execution.kind}`}
+          title={
+            execution.kind === "standby"
+              ? "Execution Plan 已固定，等待 Coordinator 启动第一个 Assignment"
+              : `当前多 Agent 任务：${execution.label}`
+          }
+        >
+          <Power size={15} />
+          <strong>{execution.label}</strong>
+          <small>多 Agent 任务</small>
+        </div>
+        {execution.kind === "running" && execution.activeRunIds.length > 0 ? (
+          <button
+            className="stop-task-button"
+            disabled={stopping}
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={stopTask}
+          >
+            {stopping ? (
+              <LoaderCircle className="spin" size={15} />
+            ) : (
+              <X size={15} />
+            )}
+            停止任务
+          </button>
+        ) : null}
+        <button
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={() => setSettingsOpen(true)}
+        >
           <Plus size={15} /> 添加模型
         </button>
       </motion.div>

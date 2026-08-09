@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   applyOverlayFocusability,
   createOverlayWindowOptions,
+  shouldOverlayCapturePointer,
 } from "./control-plane-overlay-window.mjs";
 
 test("the transparent overlay starts visible without taking desktop focus", () => {
@@ -20,17 +21,15 @@ test("the transparent overlay starts visible without taking desktop focus", () =
   );
 });
 
-test("only editing mode focuses the overlay", () => {
+test("editing mode becomes focusable without stealing desktop focus", () => {
   const calls = [],
     window = {
       setFocusable(value) {
         calls.push(["setFocusable", value]);
       },
-      show() {
-        calls.push(["show"]);
-      },
-      focus() {
-        calls.push(["focus"]);
+      isFocused() {
+        calls.push(["isFocused"]);
+        return false;
       },
       blur() {
         calls.push(["blur"]);
@@ -40,9 +39,59 @@ test("only editing mode focuses the overlay", () => {
   applyOverlayFocusability(window, false);
   assert.deepEqual(calls, [
     ["setFocusable", true],
-    ["show"],
-    ["focus"],
-    ["blur"],
+    ["isFocused"],
     ["setFocusable", false],
   ]);
+});
+
+test("leaving editing mode releases focus without hiding the overlay", () => {
+  const calls = [],
+    window = {
+      setFocusable(value) {
+        calls.push(["setFocusable", value]);
+      },
+      isFocused() {
+        calls.push(["isFocused"]);
+        return true;
+      },
+      blur() {
+        calls.push(["blur"]);
+      },
+    };
+  applyOverlayFocusability(window, false);
+  assert.deepEqual(calls, [["isFocused"], ["setFocusable", false], ["blur"]]);
+});
+
+test("main-process hit testing restores interaction over a visible module", () => {
+  const state = {
+    editing: false,
+    windowBounds: { x: 100, y: 50, width: 1200, height: 800 },
+    hitRegions: [{ x: 30, y: 40, width: 240, height: 160 }],
+  };
+  assert.equal(
+    shouldOverlayCapturePointer({
+      ...state,
+      cursor: { x: 180, y: 140 },
+    }),
+    true,
+  );
+  assert.equal(
+    shouldOverlayCapturePointer({
+      ...state,
+      cursor: { x: 600, y: 500 },
+    }),
+    false,
+  );
+});
+
+test("settings editing mode captures input across the transparent window", () => {
+  assert.equal(
+    shouldOverlayCapturePointer({
+      editing: true,
+      windowBounds: { x: 0, y: 0, width: 1200, height: 800 },
+      cursor: { x: 1100, y: 700 },
+      hitRegions: [],
+    }),
+    true,
+  );
 });
