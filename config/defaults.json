@@ -14,7 +14,7 @@
   },
   "images": {
     "agentServer": "ghcr.io/openhands/agent-server",
-    "agentCanvas": "ghcr.io/openhands/agent-canvas"
+    "agentCanvas": "ghcr.io/asahinayui/cross-agent-control-plane"
   },
   "ports": {
     "agentServer": 18000,

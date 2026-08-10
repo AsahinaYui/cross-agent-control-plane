@@ -15,7 +15,7 @@ export const AGENT_CANVAS_RELEASE_NOTES_URL =
 /** Literal shell commands — intentionally not localized. */
 export const AGENT_CANVAS_UPDATE_COMMANDS = {
   npm: "npm install -g @openhands/agent-canvas@latest",
-  docker: "docker pull ghcr.io/openhands/agent-canvas:latest",
+  docker: "docker pull ghcr.io/asahinayui/cross-agent-control-plane:latest",
 } as const;
 
 export async function fetchLatestAgentCanvasVersion(

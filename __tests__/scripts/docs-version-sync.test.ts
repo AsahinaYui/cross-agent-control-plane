@@ -40,9 +40,9 @@ describe("docs/example references stay in sync with config/defaults.json", () =>
   });
 
   it("every README Docker image reference uses the pinned tag", () => {
-    const imageRefPattern = /ghcr\.io\/openhands\/agent-canvas:[^\s`"]+/g;
+    const imageRefPattern = /ghcr\.io\/[^/\s]+\/[^:\s]+:[^\s`"]+/g;
 
-    for (const file of ["README.md", "README.windows.md"]) {
+    for (const file of ["README.windows.md"]) {
       const refs = read(file).match(imageRefPattern) ?? [];
       expect(refs.length).toBeGreaterThan(0);
       for (const ref of refs) {

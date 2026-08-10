@@ -88,7 +88,7 @@ npm view @openhands/agent-canvas@<version>
 npm view @openhands/agent-canvas dist-tags  # stable releases get `latest`
 
 # Docker
-docker pull ghcr.io/openhands/agent-canvas:<version>
+docker pull ghcr.io/asahinayui/cross-agent-control-plane:<version>
 ```
 
 External install docs on docs.openhands.dev are maintained separately; update them there when closing #1073.

@@ -14,7 +14,7 @@ function read(rel: string): string {
 }
 
 describe("npm publish workflow", () => {
-  it("uses the canonical GitHub repository in release metadata", () => {
+  it("uses the expected GitHub repositories in release metadata", () => {
     const packageJson = JSON.parse(read("package.json"));
     const dockerfile = read("docker/Dockerfile");
     const dockerWorkflow = read(".github/workflows/docker.yml");
@@ -29,10 +29,10 @@ describe("npm publish workflow", () => {
       "https://github.com/OpenHands/OpenHands/issues",
     );
     expect(dockerfile).toContain(
-      'LABEL org.opencontainers.image.source="https://github.com/OpenHands/OpenHands"',
+      'LABEL org.opencontainers.image.source="https://github.com/AsahinaYui/cross-agent-control-plane"',
     );
     expect(dockerWorkflow).toContain(
-      "https://github.com/OpenHands/OpenHands/pkgs/container/agent-canvas",
+      "https://github.com/AsahinaYui/cross-agent-control-plane/pkgs/container/cross-agent-control-plane",
     );
   });
 

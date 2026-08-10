@@ -10,7 +10,7 @@
 replicaCount: 1
 
 image:
-  repository: ghcr.io/openhands/agent-canvas
+  repository: ghcr.io/asahinayui/cross-agent-control-plane
   # Image tag is pinned to the chart's appVersion. Override with
   # `--set image.tag=sha-<...>` when you need a specific build (e.g. a PR
   # image or a hotfix that doesn't match the chart's appVersion).
