@@ -3,7 +3,8 @@
 `cap` is a thin client for the local Cross Agent Control Plane. The daemon is
 the authority for tasks, sessions, assignments, leases, handoffs, runs, and
 terminal decisions; the terminal, overlay, and editor integrations are optional
-surfaces over the same API.
+surfaces over the same API. The default state directory is `~/.cap`.
+`attach` defaults to `terminal` surface unless `--surface` is given.
 
 ## Commands
 

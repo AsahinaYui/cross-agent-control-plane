@@ -335,7 +335,7 @@ export function buildExecutionPlanInputFromWorkflow({
   return {
     fallback_policy: "disabled",
     coordinator_surface: requireString(
-      coordinatorSurface ?? "codex-cli",
+      coordinatorSurface ?? "terminal",
       "coordinatorSurface",
     ),
     concurrency_limit: workflow.limits.concurrency,
@@ -395,7 +395,218 @@ export function coordinatorSessionInput(surface) {
     provider_id: "surface-owned",
     model_id: "surface-owned",
     billing_channel: "surface-owned",
-    surface: requireString(surface ?? "codex-cli", "surface"),
+    surface: requireString(surface ?? "terminal", "surface"),
     role: "Coordinator",
   };
+}
+
+// ---------------------------------------------------------------------------
+// Attachment selector -- greatest valid timestamp for a repository
+// ---------------------------------------------------------------------------
+
+export function selectAttachment(records, repositoryRoot) {
+  let best = null;
+  let bestTs = -1;
+  for (const att of records) {
+    if (!att || typeof att !== "object") continue;
+    if (att.repository_root !== repositoryRoot) continue;
+    const ts = Date.parse(att.timestamp);
+    if (Number.isNaN(ts)) continue;
+    if (ts > bestTs) {
+      bestTs = ts;
+      best = att;
+    }
+  }
+  return best;
+}
+
+// ---------------------------------------------------------------------------
+// Bounded DAG scheduler
+// ---------------------------------------------------------------------------
+
+export async function executeWorkflowScheduler({
+  api,
+  taskId,
+  sortedSteps,
+  managedSessionIds,
+  coordinatorSessionId,
+  limits,
+  info,
+}) {
+  const completed = new Set();
+  const failed = new Set();
+  const blocked = new Set();
+  const active = new Map(); // stepId -> runId
+  const stepRuns = new Map(); // stepId -> { runId, state }
+  const concurrency = limits.concurrency ?? 1;
+  const stepById = new Map(sortedSteps.map((s) => [s.id, s]));
+
+  // Compute full transitive descendant closure for each step
+  const descendantsCache = new Map();
+  const getDescendants = (stepId) => {
+    if (descendantsCache.has(stepId)) return descendantsCache.get(stepId);
+    const result = [];
+    for (const s of sortedSteps) {
+      if (s.depends_on.includes(stepId)) {
+        result.push(s.id);
+        result.push(...getDescendants(s.id));
+      }
+    }
+    descendantsCache.set(stepId, result);
+    return result;
+  };
+
+  const isDescendantOfFailed = (stepId) =>
+    stepById.get(stepId).depends_on.some((dep) => failed.has(dep) || blocked.has(dep));
+
+  const isReady = (step) => {
+    if (completed.has(step.id) || failed.has(step.id) || blocked.has(step.id) || active.has(step.id)) return false;
+    return step.depends_on.every((dep) => completed.has(dep)) && !isDescendantOfFailed(step.id);
+  };
+
+  const allDone = () => sortedSteps.every((s) => completed.has(s.id) || failed.has(s.id) || blocked.has(s.id));
+
+  const failAndBlock = (stepId) => {
+    if (failed.has(stepId) || blocked.has(stepId)) return;
+    failed.add(stepId);
+    // Transitively block all descendants -- never launch them
+    for (const did of getDescendants(stepId)) {
+      if (!completed.has(did) && !failed.has(did) && !active.has(did)) {
+        blocked.add(did);
+      }
+    }
+  };
+
+  while (!allDone()) {
+    // Complete ready coordinator steps without launching a runtime
+    for (const step of sortedSteps) {
+      if (!isReady(step) || step.executor !== "coordinator") continue;
+      completed.add(step.id);
+    }
+
+    // Launch ready managed steps within concurrency limit
+    for (const step of sortedSteps) {
+      if (!isReady(step) || step.executor !== "managed") continue;
+      if (active.size >= concurrency) break;
+
+      const sessionId = managedSessionIds.get(step.id);
+      if (!sessionId) { failAndBlock(step.id); continue; }
+
+      let assignment;
+      try {
+        assignment = await api("POST", `/api/control-plane/v1/tasks/${taskId}/assignments`, {
+          stage_id: step.id,
+          role: step.role,
+          prompt: step.responsibility,
+          write_intent: step.writes,
+          depends_on: step.depends_on,
+          workspace_policy: step.workspace_policy,
+          timeout_seconds: step.timeout_seconds,
+          executor_kind: "managed",
+          session_id: sessionId,
+          profile: {
+            profile_id: `wf-${step.id}`,
+            runtime_id: step.runtime,
+            provider_id: step.provider.id,
+            model_id: step.model,
+            billing_channel: step.provider.billing_channel,
+            provider_source: step.provider.source,
+            ccswitch_app_type: step.provider.ccswitch_app_type,
+            provider_config_hash: step.provider.provider_config_hash,
+          },
+        });
+      } catch { failAndBlock(step.id); continue; }
+
+      let started;
+      try {
+        started = await api("POST",
+          `/api/control-plane/v1/tasks/${taskId}/assignments/${assignment.assignment_id}/runs`,
+          { coordinator_session_id: coordinatorSessionId, repository_root: info.repository_root },
+        );
+      } catch { failAndBlock(step.id); continue; }
+
+      active.set(step.id, started.run.run_id);
+      stepRuns.set(step.id, { runId: started.run.run_id, state: "running" });
+    }
+
+    // If nothing active, check if we're done or stuck
+    if (active.size === 0) {
+      if (allDone()) break;
+      const anyReady = sortedSteps.some(isReady);
+      if (!anyReady) break;
+    }
+
+    // Poll active runs -- keep siblings alive while they settle
+    if (active.size > 0) {
+      const settled = [];
+      for (const [stepId, runId] of active) {
+        let run;
+        try { run = await api("GET", `/api/control-plane/v1/runs/${runId}`); }
+        catch { run = { state: "failed" }; }
+        if (["completed", "review_ready", "failed", "blocked", "canceled", "interrupted"].includes(run.state)) {
+          if (run.state === "completed" || run.state === "review_ready") {
+            completed.add(stepId);
+            stepRuns.set(stepId, { runId, state: run.state });
+          } else {
+            failAndBlock(stepId);
+          }
+          settled.push(stepId);
+        }
+      }
+      for (const stepId of settled) active.delete(stepId);
+    }
+
+    if (active.size > 0) await new Promise((r) => setTimeout(r, 200));
+  }
+
+  // Wait for still-active runs to settle (defensive, shouldn't happen after loop)
+  if (active.size > 0) {
+    const entries = [...active.entries()];
+    for (const [stepId, runId] of entries) {
+      try {
+        const deadline = Date.now() + 300000;
+        const terminalStates = new Set(["completed", "review_ready", "failed", "blocked", "canceled", "interrupted"]);
+        let run;
+        while (Date.now() < deadline) {
+          run = await api("GET", `/api/control-plane/v1/runs/${runId}`);
+          if (terminalStates.has(run.state)) break;
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        if (!run || !terminalStates.has(run.state)) throw new Error("timeout");
+        if (run.state === "completed" || run.state === "review_ready") {
+          completed.add(stepId);
+          stepRuns.set(stepId, { runId, state: run.state });
+        } else {
+          failAndBlock(stepId);
+        }
+      } catch { failAndBlock(stepId); }
+    }
+  }
+
+  // Build per-step results in stable topological order
+  const results = [];
+  for (const step of sortedSteps) {
+    if (completed.has(step.id)) {
+      const sr = stepRuns.get(step.id);
+      results.push({ stepId: step.id, result: "completed", runId: sr?.runId ?? null });
+    } else if (failed.has(step.id)) {
+      results.push({ stepId: step.id, result: "failed", runId: null });
+    } else if (blocked.has(step.id)) {
+      results.push({ stepId: step.id, result: "blocked", runId: null });
+    }
+  }
+
+  const hasFailure = results.some((r) => r.result === "failed" || r.result === "blocked");
+  // Only return a non-null terminalRunId when the entire workflow succeeded
+  let terminalRunId = null;
+  if (!hasFailure) {
+    for (const step of sortedSteps) {
+      if (step.executor === "managed" && completed.has(step.id)) {
+        const sr = stepRuns.get(step.id);
+        if (sr) terminalRunId = sr.runId;
+      }
+    }
+  }
+
+  return { hasFailure, terminalRunId, results };
 }

@@ -9,7 +9,7 @@ import { CcSwitchProviderResolver } from "./ccswitch.mjs";
 
 function option(name,fallback) { const index=process.argv.indexOf(name);return index>=0?process.argv[index+1]:fallback; }
 const command=process.argv[2]??"serve";
-const stateRoot=resolve(option("--state",process.env.CROSS_AGENT_STATE_DIR??join(homedir(),".openhands","agent-canvas","control-plane")));
+const stateRoot=resolve(option("--state",process.env.CROSS_AGENT_STATE_DIR??join(homedir(),".cap","state")));
 const store=new ControlPlaneStore(stateRoot),orchestrator=new ControlPlaneOrchestrator({
   store,
   worktreesRoot:join(stateRoot,"worktrees"),

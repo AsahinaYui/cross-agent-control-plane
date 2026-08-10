@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { rmSync, writeFileSync, mkdtempSync, readFileSync } from "node:fs";
+import { rmSync, writeFileSync, mkdtempSync, readFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ControlPlaneStore } from "../store.mjs";
@@ -13,13 +13,9 @@ import {
   resolveWorkspacePolicy,
   buildTaskInputFromWorkflow,
   buildExecutionPlanInputFromWorkflow,
+  selectAttachment,
+  coordinatorSessionInput,
 } from "../workflow.mjs";
-import {
-  checkDuration,
-  checkInactivity,
-  checkRepeatedFailure,
-  checkBudget,
-} from "../guards.mjs";
 
 // ---------------------------------------------------------------------------
 // Workflow manifest parsing
@@ -282,102 +278,6 @@ test("resolveWorkspacePolicy prioritizes isolated over shared", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Guards
-// ---------------------------------------------------------------------------
-
-test("checkDuration allows within limit", () => {
-  const result = checkDuration(new Date(Date.now() - 5000).toISOString(), 60);
-  assert.equal(result.exceeded, false);
-  assert.ok(result.remaining_seconds > 0);
-});
-
-test("checkDuration exceeds limit", () => {
-  const result = checkDuration(new Date(Date.now() - 120000).toISOString(), 60);
-  assert.equal(result.exceeded, true);
-  assert.ok(result.remaining_seconds <= 0);
-});
-
-test("checkDuration no limit", () => {
-  const result = checkDuration(new Date().toISOString(), null);
-  assert.equal(result.exceeded, false);
-  assert.equal(result.remaining_seconds, Infinity);
-});
-
-test("checkInactivity active", () => {
-  const result = checkInactivity(new Date().toISOString(), 300);
-  assert.equal(result.timed_out, false);
-});
-
-test("checkInactivity timed out", () => {
-  const result = checkInactivity(new Date(Date.now() - 600000).toISOString(), 300);
-  assert.equal(result.timed_out, true);
-  assert.ok(result.elapsed_seconds > 300);
-});
-
-test("checkInactivity no timeout", () => {
-  const result = checkInactivity(new Date().toISOString(), null);
-  assert.equal(result.timed_out, false);
-});
-
-test("checkRepeatedFailure below limit", () => {
-  const result = checkRepeatedFailure(
-    [{ reason_code: "timeout" }, { reason_code: "timeout" }],
-    3,
-  );
-  assert.equal(result.triggered, false);
-  assert.equal(result.count, 2);
-});
-
-test("checkRepeatedFailure triggered", () => {
-  const result = checkRepeatedFailure(
-    [
-      { reason_code: "timeout" },
-      { reason_code: "timeout" },
-      { reason_code: "timeout" },
-    ],
-    2,
-  );
-  assert.equal(result.triggered, true);
-  assert.equal(result.reason_code, "timeout");
-});
-
-test("checkRepeatedFailure different codes do not trigger", () => {
-  const result = checkRepeatedFailure(
-    [
-      { reason_code: "timeout" },
-      { reason_code: "scope_violation" },
-      { reason_code: "timeout" },
-    ],
-    2,
-  );
-  assert.equal(result.triggered, false);
-});
-
-test("checkBudget unavailable", () => {
-  const result = checkBudget({ available: false }, { max_tokens: 1000 });
-  assert.equal(result.exceeded, false);
-  assert.equal(result.status, "unavailable");
-});
-
-test("checkBudget token limit exceeded", () => {
-  const result = checkBudget(
-    { available: true, tokens: 5000, cost_usd: 0 },
-    { max_tokens: 1000 },
-  );
-  assert.equal(result.exceeded, true);
-  assert.equal(result.reason, "token_limit");
-});
-
-test("checkBudget cost limit exceeded", () => {
-  const result = checkBudget(
-    { available: true, tokens: 100, cost_usd: 10 },
-    { max_tokens: 100000, max_cost_usd: 5 },
-  );
-  assert.equal(result.exceeded, true);
-  assert.equal(result.reason, "cost_limit");
-});
-
-// ---------------------------------------------------------------------------
 // Task terminal transitions (AuditDecision)
 // ---------------------------------------------------------------------------
 
@@ -541,7 +441,7 @@ test("buildExecutionPlanInputFromWorkflow produces valid plan input", () => {
   const workflow = normalizeWorkflowManifest(raw);
   const input = buildExecutionPlanInputFromWorkflow({
     workflow,
-    coordinatorSurface: "codex-cli",
+    coordinatorSurface: "terminal",
   });
   assert.equal(input.fallback_policy, "disabled");
   assert.equal(input.concurrency_limit, 1);
@@ -593,7 +493,7 @@ test("cap run with workflow produces task and plan", async () => {
 
   const planInput = buildExecutionPlanInputFromWorkflow({
     workflow,
-    coordinatorSurface: "codex-cli",
+    coordinatorSurface: "terminal",
   });
   const plan = store.createExecutionPlan(task.task_id, planInput);
   assert.equal(plan.stages.length, 1);
@@ -684,7 +584,7 @@ test("managed fake-runtime workflow produces terminal run with activity", async 
     task = store.createTask(taskInput(repo.head));
   const planInput = {
     fallback_policy: "disabled",
-    coordinator_surface: "codex-cli",
+    coordinator_surface: "terminal",
     concurrency_limit: 1,
     workspace_policy: "mission",
     limits: { max_duration_seconds: 30, repeated_failure_limit: 2 },
@@ -719,7 +619,7 @@ test("managed fake-runtime workflow produces terminal run with activity", async 
     provider_id: "surface-owned",
     model_id: "surface-owned",
     billing_channel: "surface-owned",
-    surface: "codex-cli",
+    surface: "terminal",
     role: "Coordinator",
   });
   // Acquire coordinator lease
@@ -803,4 +703,309 @@ test("managed fake-runtime workflow produces terminal run with activity", async 
   store.close();
   rmSync(repo.root, { recursive: true, force: true });
   rmSync(state, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// selectAttachment - reusable behavior
+// ---------------------------------------------------------------------------
+
+test("selectAttachment picks greatest valid timestamp", () => {
+  const repo = "/tmp/test-repo";
+  const older = { repository_root: repo, surface: "codex-cli", timestamp: "2024-01-01T00:00:00.000Z" };
+  const newer = { repository_root: repo, surface: "editor", timestamp: "2024-06-15T00:00:00.000Z" };
+  const result = selectAttachment([older, newer], repo);
+  assert.equal(result.surface, "editor");
+  assert.equal(result.timestamp, "2024-06-15T00:00:00.000Z");
+});
+
+test("selectAttachment ignores malformed records", () => {
+  const repo = "/tmp/test-repo";
+  const result = selectAttachment([
+    null,
+    { surface: "no-repo" },
+    { repository_root: repo, surface: "terminal", timestamp: "2024-01-01T00:00:00.000Z" },
+  ], repo);
+  assert.equal(result.surface, "terminal");
+});
+
+test("selectAttachment returns null when no match", () => {
+  const result = selectAttachment([{ repository_root: "/other", surface: "editor", timestamp: "2024-01-01T00:00:00.000Z" }], "/tmp/repo");
+  assert.equal(result, null);
+});
+
+test("selectAttachment ignores invalid timestamp", () => {
+  const repo = "/tmp/test-repo";
+  const result = selectAttachment([
+    { repository_root: repo, surface: "terminal", timestamp: "not-a-date" },
+    { repository_root: repo, surface: "editor", timestamp: "2024-06-15T00:00:00.000Z" },
+  ], repo);
+  assert.equal(result.surface, "editor");
+});
+
+// ---------------------------------------------------------------------------
+// Attachment surface propagation through workflow builders
+// ---------------------------------------------------------------------------
+
+test("buildExecutionPlanInputFromWorkflow propagates coordinatorSurface", () => {
+  const raw = {
+    version: 1,
+    steps: [{ id: "s1", executor: "coordinator" }],
+  };
+  const workflow = normalizeWorkflowManifest(raw);
+  const plan = buildExecutionPlanInputFromWorkflow({ workflow, coordinatorSurface: "codex-desktop" });
+  assert.equal(plan.coordinator_surface, "codex-desktop");
+});
+
+test("buildExecutionPlanInputFromWorkflow defaults to terminal", () => {
+  const raw = {
+    version: 1,
+    steps: [{ id: "s1", executor: "coordinator" }],
+  };
+  const workflow = normalizeWorkflowManifest(raw);
+  const plan = buildExecutionPlanInputFromWorkflow({ workflow });
+  assert.equal(plan.coordinator_surface, "terminal");
+});
+
+test("coordinatorSessionInput propagates surface", () => {
+  const input = coordinatorSessionInput("editor");
+  assert.equal(input.surface, "editor");
+});
+
+test("coordinatorSessionInput defaults to terminal", () => {
+  const input = coordinatorSessionInput();
+  assert.equal(input.surface, "terminal");
+});
+
+// ---------------------------------------------------------------------------
+// executeWorkflowScheduler - behavioral tests
+// ---------------------------------------------------------------------------
+
+test("executeWorkflowScheduler handles coordinator-only steps", async () => {
+  const { executeWorkflowScheduler } = await import("../workflow.mjs");
+  const steps = [
+    { id: "a", executor: "coordinator", depends_on: [], role: "Coordinator", responsibility: "Plan", writes: false, workspace_policy: "mission", timeout_seconds: null, runtime: null, provider: null, model: null },
+    { id: "b", executor: "coordinator", depends_on: ["a"], role: "Coordinator", responsibility: "Review", writes: false, workspace_policy: "mission", timeout_seconds: null, runtime: null, provider: null, model: null },
+  ];
+  const result = await executeWorkflowScheduler({
+    api: null, taskId: "test", sortedSteps: steps,
+    managedSessionIds: new Map(), coordinatorSessionId: "ses",
+    limits: { concurrency: 1 }, info: { repository_root: "/tmp" },
+  });
+  assert.equal(result.hasFailure, false);
+  assert.equal(result.terminalRunId, null);
+  assert.deepEqual(result.results.map(r => r.result), ["completed", "completed"]);
+});
+
+test("executeWorkflowScheduler respects concurrency limit and measures peak", async () => {
+  const { executeWorkflowScheduler } = await import("../workflow.mjs");
+  let activeCount = 0;
+  let peakActive = 0;
+  const settled = new Set();
+  const fakeApi = (method, path, body) => {
+    if (method === "POST" && path.includes("/assignments") && !path.includes("/runs"))
+      return Promise.resolve({ assignment_id: `asn_${Date.now()}` });
+    if (method === "POST" && path.includes("/runs")) {
+      activeCount++;
+      peakActive = Math.max(peakActive, activeCount);
+      return Promise.resolve({ run: { run_id: `run_${Date.now()}` } });
+    }
+    if (method === "GET" && path.includes("/runs/")) {
+      activeCount--;
+      return Promise.resolve({ state: "completed" });
+    }
+    return Promise.resolve({});
+  };
+  const steps = [
+    { id: "s1", executor: "managed", depends_on: [], runtime: "fake", provider: { id: "test", source: "test", billing_channel: "test", ccswitch_app_type: null, provider_config_hash: null }, model: "test", role: "Worker", responsibility: "Step 1", writes: false, workspace_policy: "mission", timeout_seconds: null },
+    { id: "s2", executor: "managed", depends_on: [], runtime: "fake", provider: { id: "test", source: "test", billing_channel: "test", ccswitch_app_type: null, provider_config_hash: null }, model: "test", role: "Worker", responsibility: "Step 2", writes: false, workspace_policy: "mission", timeout_seconds: null },
+    { id: "s3", executor: "managed", depends_on: [], runtime: "fake", provider: { id: "test", source: "test", billing_channel: "test", ccswitch_app_type: null, provider_config_hash: null }, model: "test", role: "Worker", responsibility: "Step 3", writes: false, workspace_policy: "mission", timeout_seconds: null },
+  ];
+  const mids = new Map();
+  for (const s of steps) mids.set(s.id, `ses-${s.id}`);
+  const result = await executeWorkflowScheduler({
+    api: fakeApi, taskId: "test-concurrency", sortedSteps: steps,
+    managedSessionIds: mids, coordinatorSessionId: "ses",
+    limits: { concurrency: 2 }, info: { repository_root: "/tmp" },
+  });
+  assert.equal(result.hasFailure, false);
+  assert.ok(result.terminalRunId);
+  assert.ok(peakActive <= 2, `Peak active ${peakActive} exceeded concurrency limit 2`);
+  assert.ok(peakActive >= 2, `Peak active ${peakActive} was below expected parallelism 2`);
+});
+
+test("executeWorkflowScheduler fan-in proves dependency waits", async () => {
+  const { executeWorkflowScheduler } = await import("../workflow.mjs");
+  const launchOrder = [];
+  const stepRunIds = new Map();
+  const fakeApi = (method, path, body) => {
+    if (method === "POST" && path.includes("/assignments") && !path.includes("/runs")) {
+      const sid = body?.stage_id || "unknown";
+      return Promise.resolve({ assignment_id: `asn_${sid}` });
+    }
+    if (method === "POST" && path.includes("/runs")) {
+      const asnId = path.split("/assignments/")[1]?.split("/")[0] || "unknown";
+      const sid = asnId.replace("asn_", "");
+      launchOrder.push(sid);
+      const runId = `run_${sid}`;
+      stepRunIds.set(sid, runId);
+      return Promise.resolve({ run: { run_id: runId } });
+    }
+    if (method === "GET" && path.includes("/runs/"))
+      return Promise.resolve({ state: "completed" });
+    return Promise.resolve({});
+  };
+  const steps = [
+    { id: "a", executor: "managed", depends_on: [], runtime: "fake", provider: { id: "test", source: "test", billing_channel: "test", ccswitch_app_type: null, provider_config_hash: null }, model: "test", role: "Worker", responsibility: "A", writes: false, workspace_policy: "mission", timeout_seconds: null },
+    { id: "b", executor: "managed", depends_on: [], runtime: "fake", provider: { id: "test", source: "test", billing_channel: "test", ccswitch_app_type: null, provider_config_hash: null }, model: "test", role: "Worker", responsibility: "B", writes: false, workspace_policy: "mission", timeout_seconds: null },
+    { id: "c", executor: "managed", depends_on: ["a", "b"], runtime: "fake", provider: { id: "test", source: "test", billing_channel: "test", ccswitch_app_type: null, provider_config_hash: null }, model: "test", role: "Worker", responsibility: "C", writes: false, workspace_policy: "mission", timeout_seconds: null },
+  ];
+  const mids = new Map();
+  for (const s of steps) mids.set(s.id, `ses-${s.id}`);
+  const result = await executeWorkflowScheduler({
+    api: fakeApi, taskId: "test-fanin2", sortedSteps: steps,
+    managedSessionIds: mids, coordinatorSessionId: "ses",
+    limits: { concurrency: 3 }, info: { repository_root: "/tmp" },
+  });
+  assert.equal(result.hasFailure, false);
+  // a and b must launch before c
+  const cIdx = launchOrder.indexOf("c");
+  const aIdx = launchOrder.indexOf("a");
+  const bIdx = launchOrder.indexOf("b");
+  assert.ok(aIdx >= 0 && bIdx >= 0 && cIdx >= 0, "All steps must launch");
+  assert.ok(aIdx < cIdx, "a must launch before c");
+  assert.ok(bIdx < cIdx, "b must launch before c");
+});
+
+test("executeWorkflowScheduler transitive blocking a->b->c", async () => {
+  const { executeWorkflowScheduler } = await import("../workflow.mjs");
+  const launchedSteps = [];
+  const fakeApi = (method, path, body) => {
+    if (method === "POST" && path.includes("/assignments") && !path.includes("/runs")) {
+      const sid = body?.stage_id || "unknown";
+      return Promise.resolve({ assignment_id: `asn_${sid}` });
+    }
+    if (method === "POST" && path.includes("/runs")) {
+      const asnId = path.split("/assignments/")[1]?.split("/")[0] || "unknown";
+      const sid = asnId.replace("asn_", "");
+      launchedSteps.push(sid);
+      return Promise.resolve({ run: { run_id: `run_${sid}` } });
+    }
+    if (method === "GET" && path.includes("/runs/"))
+      return Promise.resolve({ state: "failed" });
+    return Promise.resolve({});
+  };
+  const steps = [
+    { id: "a", executor: "managed", depends_on: [], runtime: "fake", provider: { id: "test", source: "test", billing_channel: "test", ccswitch_app_type: null, provider_config_hash: null }, model: "test", role: "Worker", responsibility: "A", writes: false, workspace_policy: "mission", timeout_seconds: null },
+    { id: "b", executor: "managed", depends_on: ["a"], runtime: "fake", provider: { id: "test", source: "test", billing_channel: "test", ccswitch_app_type: null, provider_config_hash: null }, model: "test", role: "Worker", responsibility: "B", writes: false, workspace_policy: "mission", timeout_seconds: null },
+    { id: "c", executor: "managed", depends_on: ["b"], runtime: "fake", provider: { id: "test", source: "test", billing_channel: "test", ccswitch_app_type: null, provider_config_hash: null }, model: "test", role: "Worker", responsibility: "C", writes: false, workspace_policy: "mission", timeout_seconds: null },
+  ];
+  const mids = new Map();
+  for (const s of steps) mids.set(s.id, `ses-${s.id}`);
+  const result = await executeWorkflowScheduler({
+    api: fakeApi, taskId: "test-transitive-chain", sortedSteps: steps,
+    managedSessionIds: mids, coordinatorSessionId: "ses",
+    limits: { concurrency: 1 }, info: { repository_root: "/tmp" },
+  });
+  assert.equal(result.hasFailure, true);
+  assert.equal(result.terminalRunId, null, "Failed workflow must have no terminal run");
+  // Only a should have been launched
+  assert.deepEqual(launchedSteps, ["a"], "Only step a should be launched");
+  // b and c must be explicitly blocked
+  const bResult = result.results.find(r => r.stepId === "b");
+  const cResult = result.results.find(r => r.stepId === "c");
+  assert.equal(bResult.result, "blocked", "b must be explicitly blocked");
+  assert.equal(cResult.result, "blocked", "c must be explicitly blocked");
+  // a must be failed
+  const aResult = result.results.find(r => r.stepId === "a");
+  assert.equal(aResult.result, "failed", "a must be failed");
+});
+
+test("executeWorkflowScheduler sibling settlement", async () => {
+  const { executeWorkflowScheduler } = await import("../workflow.mjs");
+  const pollResults = {};
+  const stepOrder = [];
+  const fakeApi = (method, path, body) => {
+    if (method === "POST" && path.includes("/assignments") && !path.includes("/runs")) {
+      const sid = body?.stage_id || "unknown";
+      return Promise.resolve({ assignment_id: `asn_${sid}` });
+    }
+    if (method === "POST" && path.includes("/runs")) {
+      const asnId = path.split("/assignments/")[1]?.split("/")[0] || "unknown";
+      const sid = asnId.replace("asn_", "");
+      stepOrder.push(sid);
+      pollResults[sid] = "running";
+      return Promise.resolve({ run: { run_id: `run_${sid}` } });
+    }
+    if (method === "GET" && path.includes("/runs/")) {
+      const runId = path.split("/runs/")[1];
+      const stepId = runId.replace("run_", "");
+      // s1 fails, s2 succeeds
+      if (stepId === "s1") {
+        pollResults[stepId] = "failed";
+        return Promise.resolve({ state: "failed" });
+      }
+      if (stepId === "s2") {
+        pollResults[stepId] = "completed";
+        return Promise.resolve({ state: "completed" });
+      }
+      return Promise.resolve({ state: "completed" });
+    }
+    return Promise.resolve({});
+  };
+  const steps = [
+    { id: "s1", executor: "managed", depends_on: [], runtime: "fake", provider: { id: "test", source: "test", billing_channel: "test", ccswitch_app_type: null, provider_config_hash: null }, model: "test", role: "Worker", responsibility: "S1", writes: false, workspace_policy: "mission", timeout_seconds: null },
+    { id: "s2", executor: "managed", depends_on: [], runtime: "fake", provider: { id: "test", source: "test", billing_channel: "test", ccswitch_app_type: null, provider_config_hash: null }, model: "test", role: "Worker", responsibility: "S2", writes: false, workspace_policy: "mission", timeout_seconds: null },
+    { id: "s3", executor: "managed", depends_on: ["s2"], runtime: "fake", provider: { id: "test", source: "test", billing_channel: "test", ccswitch_app_type: null, provider_config_hash: null }, model: "test", role: "Worker", responsibility: "S3", writes: false, workspace_policy: "mission", timeout_seconds: null },
+  ];
+  const mids = new Map();
+  for (const s of steps) mids.set(s.id, `ses-${s.id}`);
+  const result = await executeWorkflowScheduler({
+    api: fakeApi, taskId: "test-sibling-settle", sortedSteps: steps,
+    managedSessionIds: mids, coordinatorSessionId: "ses",
+    limits: { concurrency: 3 }, info: { repository_root: "/tmp" },
+  });
+  assert.equal(result.hasFailure, true, "Workflow should have failure");
+  assert.equal(result.terminalRunId, null, "Failed workflow must have no terminal run");
+  // Both s1 and s2 must have been launched
+  assert.ok(stepOrder.includes("s1"), "s1 must be launched");
+  assert.ok(stepOrder.includes("s2"), "s2 must be launched");
+  // s2 must be polled to completion (sibling settlement)
+  assert.equal(pollResults["s2"], "completed", "s2 must be polled to completion");
+  // s3 must be completed (depends on s2 which succeeded)
+  const s3Result = result.results.find(r => r.stepId === "s3");
+  assert.equal(s3Result.result, "completed", "s3 must complete since s2 succeeded");
+  // s1 must be failed
+  const s1Result = result.results.find(r => r.stepId === "s1");
+  assert.equal(s1Result.result, "failed", "s1 must be failed");
+  // s2 must be completed
+  const s2Result = result.results.find(r => r.stepId === "s2");
+  assert.equal(s2Result.result, "completed", "s2 must be completed");
+  // No forbidden descendant launches
+  assert.equal(stepOrder.length, 3, "Only 3 steps should be launched (s1, s2, s3)");
+});
+
+test("executeWorkflowScheduler late-ready Coordinator steps", async () => {
+  const { executeWorkflowScheduler } = await import("../workflow.mjs");
+  const fakeApi = (method, path, body) => {
+    if (method === "POST" && path.includes("/assignments") && !path.includes("/runs"))
+      return Promise.resolve({ assignment_id: `asn_${Date.now()}` });
+    if (method === "POST" && path.includes("/runs"))
+      return Promise.resolve({ run: { run_id: `run_${Date.now()}` } });
+    if (method === "GET" && path.includes("/runs/"))
+      return Promise.resolve({ state: "completed" });
+    return Promise.resolve({});
+  };
+  const steps = [
+    { id: "impl", executor: "managed", depends_on: [], runtime: "fake", provider: { id: "test", source: "test", billing_channel: "test", ccswitch_app_type: null, provider_config_hash: null }, model: "test", role: "Worker", responsibility: "Implement", writes: false, workspace_policy: "mission", timeout_seconds: null },
+    { id: "review", executor: "coordinator", depends_on: ["impl"], role: "Coordinator", responsibility: "Review", writes: false, workspace_policy: "mission", timeout_seconds: null, runtime: null, provider: null, model: null },
+  ];
+  const mids = new Map();
+  mids.set("impl", "ses-impl");
+  const result = await executeWorkflowScheduler({
+    api: fakeApi, taskId: "test-late-coord", sortedSteps: steps,
+    managedSessionIds: mids, coordinatorSessionId: "ses",
+    limits: { concurrency: 1 }, info: { repository_root: "/tmp" },
+  });
+  assert.equal(result.hasFailure, false);
+  assert.ok(result.terminalRunId);
 });

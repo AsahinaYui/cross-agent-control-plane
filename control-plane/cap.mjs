@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { spawn } from "node:child_process";
@@ -14,11 +14,15 @@ import {
   resolveWorkspacePolicy,
   buildTaskInputFromWorkflow,
   buildExecutionPlanInputFromWorkflow,
+  managedSessionInputFromStep,
+  coordinatorSessionInput,
+  selectAttachment,
+  executeWorkflowScheduler,
 } from "./workflow.mjs";
 import { inspectRepository } from "./worktree.mjs";
 import { makeId, nowIso } from "./protocol.mjs";
 
-const CAP_DIR = process.env.CAP_DIR || join(homedir(), ".openhands", "cap");
+const CAP_DIR = process.env.CAP_DIR || join(homedir(), ".cap");
 const DEFAULT_PORT = 4899;
 const CTL = `http://127.0.0.1:${DEFAULT_PORT}`;
 
@@ -61,7 +65,9 @@ async function startDaemon(overlay) {
   }
   writePid();
   const store = new ControlPlaneStore(statePath());
-  const providerResolver = new CcSwitchProviderResolver();
+  const providerResolver = new CcSwitchProviderResolver({
+    runtimeConfigRoot: join(CAP_DIR, "runtime-configs"),
+  });
   const orchestrator = new ControlPlaneOrchestrator({
     store,
     worktreesRoot: join(CAP_DIR, "worktrees"),
@@ -70,7 +76,6 @@ async function startDaemon(overlay) {
   const server = createControlPlaneServer({
     store,
     orchestrator,
-    providerCatalog: () => providerResolver.catalog(),
   });
   await new Promise((resolve) => server.listen(DEFAULT_PORT, resolve));
   console.error(`Control plane daemon listening on http://127.0.0.1:${DEFAULT_PORT}`);
@@ -139,7 +144,27 @@ async function pollRunCompletion(runId, timeoutMs = 300000) {
 }
 
 // ---------------------------------------------------------------------------
-// Commands
+// Attachment reader - selects greatest valid timestamp for repository
+// ---------------------------------------------------------------------------
+
+export async function readAttachments(repositoryRoot, attachmentsDir) {
+  const dir = attachmentsDir || join(CAP_DIR, "attachments");
+  if (!existsSync(dir)) return null;
+  const files = readdirSync(dir).filter((f) => f.endsWith(".json"));
+  const records = [];
+  for (const file of files) {
+    try {
+      const raw = readFileSync(join(dir, file), "utf8");
+      records.push(JSON.parse(raw));
+    } catch {
+      // skip malformed records
+    }
+  }
+  return selectAttachment(records, repositoryRoot);
+}
+
+// ---------------------------------------------------------------------------
+// Bounded DAG scheduler
 // ---------------------------------------------------------------------------
 
 async function cmdUp(args) {
@@ -174,7 +199,7 @@ async function cmdUp(args) {
 
 async function cmdAttach(args) {
   const repository = args[0] || process.cwd();
-  const surface = args.includes("--surface") ? args[args.indexOf("--surface") + 1] : "codex-cli";
+  const surface = args.includes("--surface") ? args[args.indexOf("--surface") + 1] : "terminal";
   const info = await inspectRepository(resolve(repository));
   const attachment = {
     repository_root: info.repository_root,
@@ -211,9 +236,14 @@ async function cmdRun(args) {
     baseCommit: info.head,
   });
   const task = await api("POST", "/api/control-plane/v1/tasks", taskInput);
+
+  // Read attachment for surface identity
+  const attachment = await readAttachments(info.repository_root);
+  const surface = attachment?.surface ?? "terminal";
+
   const planInput = buildExecutionPlanInputFromWorkflow({
     workflow,
-    coordinatorSurface: "codex-cli",
+    coordinatorSurface: surface,
   });
   await api(
     "POST",
@@ -224,15 +254,7 @@ async function cmdRun(args) {
   const coordinatorSession = await api(
     "POST",
     `/api/control-plane/v1/tasks/${task.task_id}/sessions`,
-    {
-      profile_id: "current-session-coordinator",
-      runtime_id: "current-session",
-      provider_id: "surface-owned",
-      model_id: "surface-owned",
-      billing_channel: "surface-owned",
-      surface: "codex-cli",
-      role: "Coordinator",
-    },
+    coordinatorSessionInput(surface),
   );
   // Acquire coordinator lease
   await api(
@@ -268,68 +290,21 @@ async function cmdRun(args) {
       managedSessionIds.set(step.id, session.session_id);
     }
   }
-  // Create assignments for each step - assign managed sessions immediately
-  let lastCompletedRunId = null;
-  for (const step of sorted) {
-    const assignmentInput = {
-      stage_id: step.id,
-      role: step.role,
-      prompt: step.responsibility,
-      write_intent: step.writes,
-      depends_on: step.depends_on,
-      workspace_policy: step.workspace_policy,
-      timeout_seconds: step.timeout_seconds,
-      executor_kind: step.executor === "coordinator" ? "coordinator" : "managed",
-    };
-    if (step.executor === "managed") {
-      const sessionId = managedSessionIds.get(step.id);
-      assignmentInput.session_id = sessionId;
-      assignmentInput.profile = {
-        profile_id: `wf-${step.id}`,
-        runtime_id: step.runtime,
-        provider_id: step.provider.id,
-        model_id: step.model,
-        billing_channel: step.provider.billing_channel,
-        provider_source: step.provider.source,
-        ccswitch_app_type: step.provider.ccswitch_app_type,
-        provider_config_hash: step.provider.provider_config_hash,
-      };
-    } else {
-      assignmentInput.profile = null;
-    }
-    const assignment = await api(
-      "POST",
-      `/api/control-plane/v1/tasks/${task.task_id}/assignments`,
-      assignmentInput,
-    );
-    if (step.executor === "managed") {
-      // Start a managed run via the assignments/runs endpoint with coordinator_session_id
-      const started = await api(
-        "POST",
-        `/api/control-plane/v1/tasks/${task.task_id}/assignments/${assignment.assignment_id}/runs`,
-        {
-          coordinator_session_id: coordinatorSession.session_id,
-          repository_root: info.repository_root,
-          runtime_options: {
-            mode: "success",
-            provider: step.provider.source,
-          },
-        },
-      );
-      const completed = await pollRunCompletion(started.run.run_id);
-      if (!["completed", "review_ready"].includes(completed.state)) {
-        throw new Error(
-          `Workflow step ${step.id} ended in ${completed.state}`,
-        );
-      }
-      lastCompletedRunId = completed.run_id;
-    }
-  }
-  if (lastCompletedRunId) {
+  // Run the bounded DAG scheduler
+  const { hasFailure, terminalRunId } = await executeWorkflowScheduler({
+    api,
+    taskId: task.task_id,
+    sortedSteps: sorted,
+    managedSessionIds,
+    coordinatorSessionId: coordinatorSession.session_id,
+    limits: workflow.limits,
+    info,
+  });
+  if (!hasFailure && terminalRunId) {
     await api(
       "POST",
       `/api/control-plane/v1/tasks/${task.task_id}/finalize`,
-      { run_id: lastCompletedRunId },
+      { run_id: terminalRunId },
     );
   }
   const completedTask = await api(
@@ -340,7 +315,9 @@ async function cmdRun(args) {
     task_id: task.task_id,
     coordinator_session_id: coordinatorSession.session_id,
     state: completedTask.state,
+    has_failure: hasFailure,
   }, null, 2));
+  if (hasFailure) process.exitCode = 1;
 }
 async function cmdStatus(args) {
   const taskId = args[0];
@@ -477,7 +454,7 @@ Commands:
   decide <task-id> --decision accepted|changes_requested|rejected  Persist terminal decision
 
 Environment:
-  CAP_DIR  Override state directory (default: ~/.openhands/cap)
+  CAP_DIR  Override state directory (default: ~/.cap)
 `);
     return;
   }
@@ -501,7 +478,9 @@ Environment:
   if (!["up", "__daemon"].includes(command) && !isRunning()) {
     console.error("Control plane daemon is not running. Starting it...");
     const store = new ControlPlaneStore(statePath());
-    const providerResolver = new CcSwitchProviderResolver();
+    const providerResolver = new CcSwitchProviderResolver({
+      runtimeConfigRoot: join(CAP_DIR, "runtime-configs"),
+    });
     const orchestrator = new ControlPlaneOrchestrator({
       store,
       worktreesRoot: join(CAP_DIR, "worktrees"),
@@ -510,7 +489,6 @@ Environment:
     const server = createControlPlaneServer({
       store,
       orchestrator,
-      providerCatalog: () => providerResolver.catalog(),
     });
     await new Promise((resolve) => server.listen(DEFAULT_PORT, resolve));
     localStore = store;

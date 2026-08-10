@@ -380,9 +380,10 @@ test("a correction run preserves parent, delta, and model identity", async () =>
   store.close();
   rmSync(repo.root, { recursive: true, force: true });
   rmSync(state, { recursive: true, force: true });
+});
 
 // ---------------------------------------------------------------------------
-// Guard tests
+// Guard integration tests
 // ---------------------------------------------------------------------------
 
 test("guard duration exceeded fails the run with guard_duration_exceeded", async () => {
@@ -441,6 +442,10 @@ test("guard inactivity timeout triggers with no activity", async () => {
   rmSync(repo.root, { recursive: true, force: true });
   rmSync(state, { recursive: true, force: true });
 });
+
+// ---------------------------------------------------------------------------
+// Guard unit tests
+// ---------------------------------------------------------------------------
 
 test("checkDuration returns exceeded when elapsed > max", () => {
   const past = new Date(Date.now() - 5000).toISOString();
@@ -549,5 +554,4 @@ test("checkBudget returns unavailable when accumulator.available is false", () =
   const result = checkBudget({ available: false }, { max_tokens: 500, max_cost_usd: null });
   assert.equal(result.exceeded, false);
   assert.equal(result.status, "unavailable");
-});
 });
