@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { readLease, isProcessAlive, spawnOwnedProcess } from "./process.mjs";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
+export const RUNTIME_ADAPTER_CONTRACT_VERSION = "cross-agent/runtime-adapter/v1";
 const commonCapabilities = {
   structured_events: true,
   graceful_cancel: true,
@@ -14,6 +15,44 @@ const commonCapabilities = {
   recovery_probe: true,
 };
 
+function normalizeUsage(value) {
+  if (!value || typeof value !== "object") return null;
+  const promptTokens =
+    value.prompt_tokens ?? value.input_tokens ?? value.promptTokens ?? null;
+  const completionTokens =
+    value.completion_tokens ??
+    value.output_tokens ??
+    value.completionTokens ??
+    null;
+  const totalTokens =
+    value.total_tokens ?? value.totalTokens ??
+    (Number.isFinite(promptTokens) || Number.isFinite(completionTokens)
+      ? (Number(promptTokens) || 0) + (Number(completionTokens) || 0)
+      : null);
+  const costUsd = value.cost_usd ?? value.costUsd ?? null;
+  if (
+    ![promptTokens, completionTokens, totalTokens, costUsd].some((item) =>
+      Number.isFinite(item),
+    )
+  )
+    return null;
+  return {
+    prompt_tokens: Number.isFinite(promptTokens) ? Number(promptTokens) : null,
+    completion_tokens: Number.isFinite(completionTokens)
+      ? Number(completionTokens)
+      : null,
+    total_tokens: Number.isFinite(totalTokens) ? Number(totalTokens) : null,
+    cost_usd: Number.isFinite(costUsd) ? Number(costUsd) : null,
+  };
+}
+
+function assertAdapterContract(adapter) {
+  for (const name of ["describe", "start", "wait", "cancel", "recover", "normalize"])
+    if (typeof adapter?.[name] !== "function")
+      throw new Error(`Runtime adapter contract violation: missing ${name}()`);
+  return adapter;
+}
+
 class ProcessRuntimeAdapter {
   constructor(runtimeId, adapterVersion, commandBuilder, capabilities = {}) {
     this.runtimeId = runtimeId;
@@ -23,12 +62,26 @@ class ProcessRuntimeAdapter {
   }
   async describe() {
     return {
+      contract_version: RUNTIME_ADAPTER_CONTRACT_VERSION,
       runtime_id: this.runtimeId,
       adapter_version: this.adapterVersion,
       capabilities: this.capabilities,
     };
   }
   normalize(parsed, context = {}) {
+    const usage =
+      parsed.type === "usage.observed"
+        ? normalizeUsage(parsed.data ?? parsed.usage ?? parsed)
+        : null;
+    if (usage)
+      return {
+        usage,
+        event: {
+          type: "usage.observed",
+          summary: "Runtime usage observed",
+          data: { usage },
+        },
+      };
     if (parsed.type === "result")
       return {
         terminal: {
@@ -52,7 +105,7 @@ class ProcessRuntimeAdapter {
     const argv = this.commandBuilder(input);
     let stdoutBuffer = "",
       stderrBuffer = "";
-    const handle = spawnOwnedProcess({
+    const handle = await spawnOwnedProcess({
       argv,
       cwd: input.worktree_path,
       env: input.env,
@@ -113,7 +166,7 @@ export class FakeRuntimeAdapter extends ProcessRuntimeAdapter {
       join(here, "fake-runtime.mjs"),
       "--mode",
       input.runtime_options?.mode ?? "success",
-    ]);
+    ], { usage_observation: true });
   }
 }
 
@@ -273,8 +326,10 @@ export class CodexRuntimeAdapter extends ProcessRuntimeAdapter {
   }
 }
 export function createRuntimeAdapter(runtimeId) {
-  if (runtimeId === "fake") return new FakeRuntimeAdapter();
-  if (runtimeId === "claude-cli") return new ClaudeRuntimeAdapter();
-  if (runtimeId === "codex-cli") return new CodexRuntimeAdapter();
+  if (runtimeId === "fake") return assertAdapterContract(new FakeRuntimeAdapter());
+  if (runtimeId === "claude-cli")
+    return assertAdapterContract(new ClaudeRuntimeAdapter());
+  if (runtimeId === "codex-cli")
+    return assertAdapterContract(new CodexRuntimeAdapter());
   throw new Error(`Unknown runtime adapter: ${runtimeId}`);
 }

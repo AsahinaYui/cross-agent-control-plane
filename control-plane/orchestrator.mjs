@@ -2,9 +2,15 @@ import { join, resolve } from "node:path";
 import { makeId, nowIso } from "./protocol.mjs";
 import { writeLease } from "./process.mjs";
 import { createRuntimeAdapter } from "./runtime-adapters.mjs";
-import { captureGitEvidence, createMissionWorktree } from "./worktree.mjs";
+import { captureGitEvidence, createMissionWorktree, createIsolatedWorktree, inspectRepository } from "./worktree.mjs";
 import { runVerificationMatrix } from "./verification.mjs";
 import { evaluateScope } from "./scope.mjs";
+import {
+  checkDuration,
+  checkInactivity,
+  checkRepeatedFailure,
+  checkBudget,
+} from "./guards.mjs";
 
 function assignmentPrompt(assignment, inboundHandoffs) {
   const permission = assignment.write_intent
@@ -138,6 +144,17 @@ export class ControlPlaneOrchestrator {
       throw new Error(
         `Assignment must be assigned, observed ${assignment.state}`,
       );
+        // Check DAG dependencies before starting
+    if (assignment.depends_on && assignment.depends_on.length > 0) {
+      const plan = this.store.getExecutionPlan(assignment.task_id, assignment.plan_revision);
+      if (plan) {
+        const { blocked, reason } = await this.#checkDagDependencies(assignment);
+        if (blocked) {
+          this.store.transitionAssignment(assignmentId, "blocked");
+          throw new Error(`Assignment blocked by dependency: ${reason}`);
+        }
+      }
+    }
     const task = this.store.getTask(
         assignment.task_id,
         assignment.task_revision,
@@ -153,13 +170,18 @@ export class ControlPlaneOrchestrator {
         throw new Error(
           `${assignment.profile.runtime_id} lacks required capability: ${capability}`,
         );
-    const worktree = await this.#ensureMissionWorkspace(task, repositoryRoot),
+    const runId = makeId("run"),
+      worktree = await this.#resolveWorkspace({
+        policy: assignment.workspace_policy ?? "mission",
+        task,
+        repositoryRoot,
+        runId,
+      }),
       inboundHandoffs = this.store.listHandoffs(task.task_id, {
         toStageId: assignment.stage_id,
       }),
       executionPrompt = assignmentPrompt(assignment, inboundHandoffs);
-    let writeLease = null,
-      runId = null;
+    let writeLease = null;
     if (assignment.write_intent)
       writeLease = this.store.acquireLease(
         task.task_id,
@@ -168,7 +190,6 @@ export class ControlPlaneOrchestrator {
         { assignment_id: assignmentId, ttl_seconds: 86400 },
       );
     try {
-      runId = makeId("run");
       const providerLaunch = this.providerResolver
           ? this.providerResolver.resolve(assignment.profile, {
               runId,
@@ -303,6 +324,65 @@ export class ControlPlaneOrchestrator {
       this.workspacePreparing.delete(task.task_id);
     }
   }
+
+  async #resolveWorkspace({ policy, task, repositoryRoot, runId }) {
+    switch (policy) {
+      case "shared": {
+        const activeRuns = [...this.active.keys()];
+        for (const activeRunId of activeRuns) {
+          const activeRun = this.store.getRun(activeRunId);
+          if (activeRun && activeRun.write_intent && activeRun.run_id !== runId)
+            throw new Error("Shared workspace policy: concurrent writer detected");
+        }
+        const info = await inspectRepository(repositoryRoot);
+        return {
+          worktree_id: `shared_${task.task_id}`,
+          worktree_path: info.repository_root,
+          base_commit: info.head,
+        };
+      }
+      case "isolated": {
+        const worktree = await createIsolatedWorktree({
+          repositoryRoot,
+          baseCommit: task.source.base_commit,
+          worktreesRoot: this.worktreesRoot,
+          runId: runId ?? task.task_id,
+        });
+        return worktree;
+      }
+      case "auto": {
+        const activeRuns = [...this.active.keys()];
+        const hasConcurrentWriter = activeRuns.some((activeRunId) => {
+          const activeRun = this.store.getRun(activeRunId);
+          return activeRun && activeRun.write_intent;
+        });
+        if (hasConcurrentWriter) {
+          return this.#resolveWorkspace({ policy: "isolated", task, repositoryRoot, runId });
+        }
+        return this.#ensureMissionWorkspace(task, repositoryRoot);
+      }
+      case "mission":
+      default: {
+        return this.#ensureMissionWorkspace(task, repositoryRoot);
+      }
+    }
+  }
+
+  async #checkDagDependencies(assignment) {
+    const dependencyIds = assignment.depends_on ?? [];
+    if (!dependencyIds.length) return { blocked: false };
+    for (const depId of dependencyIds) {
+      const depAssignments = this.store
+        .listAssignments(assignment.task_id)
+        .filter((a) => a.stage_id === depId);
+      const completedDep = depAssignments.find((a) => a.state === "completed");
+      if (!completedDep) return { blocked: true, reason: `Dependency ${depId} not yet completed` };
+      const depRun = this.store.getRun(completedDep.run_id);
+      if (depRun && depRun.state !== "completed") return { blocked: true, reason: `Dependency ${depId} run not completed` };
+    }
+    return { blocked: false };
+  }
+
   async #execute({
     runId,
     task,
@@ -403,8 +483,119 @@ export class ControlPlaneOrchestrator {
               void adapter.cancel(handle);
             }, timeoutSeconds * 1000)
           : null;
+      // Guard polling loop around adapter.wait
+      let guardTriggered = false;
+      let guardReason = null;
+      let usageUnavailableRecorded = false;
+      const guardAssignment = assignmentId
+        ? this.store.getAssignment(assignmentId)
+        : null;
+      const guardPlan = guardAssignment
+        ? this.store.getExecutionPlan(
+            task.task_id,
+            guardAssignment.plan_revision,
+          )
+        : null;
+      const taskLimits = task.execution?.budget ?? {};
+      const configuredLimits = {
+        ...taskLimits,
+        ...(guardPlan?.limits ?? {}),
+      };
+      const guardInterval = 5000; // poll every 5 seconds
+      const guardPoll = setInterval(() => {
+        if (guardTriggered) return;
+        // Duration guard
+        const planLimits = {
+          max_duration_seconds:
+            configuredLimits.max_duration_seconds ??
+            configuredLimits.timeout_seconds ??
+            null,
+          inactivity_timeout_seconds:
+            configuredLimits.inactivity_timeout_seconds ?? null,
+          repeated_failure_limit:
+            configuredLimits.repeated_failure_limit ?? null,
+          max_tokens: configuredLimits.max_tokens ?? null,
+          max_cost_usd: configuredLimits.max_cost_usd ?? null,
+        };
+        const taskRuns = this.store.listTaskRuns(task.task_id);
+        if (planLimits.max_duration_seconds) {
+          const dur = checkDuration(task.created_at, planLimits.max_duration_seconds);
+          if (dur.exceeded) {
+            guardTriggered = true;
+            guardReason = { reason_code: "guard_duration_exceeded", reason: `max_duration=${planLimits.max_duration_seconds}s exceeded` };
+            void adapter.cancel(handle);
+          }
+        }
+        if (!guardTriggered && planLimits.inactivity_timeout_seconds) {
+          const events = this.store.listEvents(runId);
+          const lastEvent = events.length > 0 ? events[events.length - 1] : null;
+          const lastActivity = lastEvent?.occurred_at ?? task.created_at;
+          const inact = checkInactivity(lastActivity, planLimits.inactivity_timeout_seconds);
+          if (inact.timed_out) {
+            guardTriggered = true;
+            guardReason = { reason_code: "guard_inactivity_timeout", reason: `inactivity=${planLimits.inactivity_timeout_seconds}s` };
+            void adapter.cancel(handle);
+          }
+        }
+        if (!guardTriggered && planLimits.repeated_failure_limit > 0) {
+          const failedRuns = taskRuns.filter((r) => r.state === "failed" && r.run_id !== runId);
+          const failures = failedRuns.map((r) => {
+            const ev = this.store.listEvents(r.run_id).findLast((e) => e.type === "run.state_changed" && e.data.to === "failed");
+            return { reason_code: ev?.data?.reason_code ?? "unknown" };
+          });
+          const rep = checkRepeatedFailure(failures, planLimits.repeated_failure_limit);
+          if (rep.triggered) {
+            guardTriggered = true;
+            guardReason = { reason_code: "guard_repeated_failure", reason: `repeated_failure_limit=${planLimits.repeated_failure_limit}, count=${rep.count}, reason_code=${rep.reason_code}` };
+            void adapter.cancel(handle);
+          }
+        }
+        if (!guardTriggered && (planLimits.max_tokens || planLimits.max_cost_usd)) {
+          const events = this.store.listEvents(runId);
+          const usageEvents = events.filter((e) => e.type === "usage.observed");
+          const accumulator = usageEvents.length > 0 ? {
+            available: true,
+            tokens: usageEvents.reduce((sum, e) => sum + (e.data?.usage?.total_tokens ?? 0), 0),
+            cost_usd: usageEvents.reduce((sum, e) => sum + (e.data?.usage?.cost_usd ?? 0), 0),
+          } : { available: false };
+          const budget = checkBudget(accumulator, planLimits);
+          if (budget.status === "unavailable" && !usageUnavailableRecorded) {
+            this.store.appendEvent(runId, {
+              actor: { role: "System", id: "control-plane" },
+              source: { kind: "control-plane" },
+              type: "guard.usage_unavailable",
+              summary: "Usage data unavailable, budget guard skipped",
+              data: {
+                max_tokens: planLimits.max_tokens,
+                max_cost_usd: planLimits.max_cost_usd,
+              },
+            });
+            usageUnavailableRecorded = true;
+          } else if (budget.exceeded) {
+            guardTriggered = true;
+            guardReason = { reason_code: "guard_budget_exceeded", reason: `budget: ${budget.reason}` };
+            void adapter.cancel(handle);
+          }
+        }
+      }, guardInterval);
       const result = await adapter.wait(handle);
+      clearInterval(guardPoll);
       if (timer) clearTimeout(timer);
+      if (guardTriggered && guardReason) {
+        this.store.appendEvent(runId, {
+          actor: { role: "System", id: "control-plane" },
+          source: { kind: "control-plane" },
+          type: "guard.triggered",
+          summary: `Guard triggered: ${guardReason.reason_code}`,
+          data: guardReason,
+        });
+        if (["running", "waiting", "cancel_requested"].includes(this.store.getRun(runId)?.state)) {
+          this.store.transitionRun(runId, "failed", guardReason);
+          if (missionMode) this.store.transitionAssignment(assignmentId, "failed");
+          else this.store.transitionTask(task.task_id, task.revision, "blocked");
+        }
+        return this.store.getRun(runId);
+      }
       const rawText = raw.map((x) => `[${x.stream}] ${x.chunk}`).join("");
       this.store.createArtifact(runId, {
         kind: "runtime_raw_events",
@@ -580,6 +771,65 @@ export class ControlPlaneOrchestrator {
         this.store.transitionTask(task.task_id, task.revision, "blocked");
       throw error;
     }
+  }
+  async finalizeMission({ taskId, runId }) {
+    const task = this.store.getTask(taskId);
+    const run = this.store.getRun(runId);
+    if (!task || !run || run.task_id !== taskId)
+      throw new Error("Mission finalization requires a Task and Run from the same mission");
+    if (task.state === "review_ready" && run.state === "review_ready")
+      return run;
+    if (run.state !== "completed")
+      throw new Error(`Mission finalization requires a completed Run, observed ${run.state}`);
+    if (!["running", "waiting"].includes(task.state))
+      throw new Error(`Mission finalization requires a running Task, observed ${task.state}`);
+
+    const assignment = run.context?.assignment_id
+      ? this.store.getAssignment(run.context.assignment_id)
+      : this.store
+          .listAssignments(taskId)
+          .find((item) => item.run_id === runId);
+    const plan = this.store.getExecutionPlan(
+      taskId,
+      assignment?.plan_revision,
+    );
+    if (!plan) throw new Error("Mission finalization requires an ExecutionPlan");
+    const assignments = this.store.listAssignments(taskId);
+    const incomplete = plan.stages
+      .filter((stage) => stage.executor_kind !== "coordinator")
+      .filter(
+        (stage) =>
+          !assignments.some(
+            (item) =>
+              item.plan_revision === plan.revision &&
+              item.stage_id === stage.stage_id &&
+              item.state === "completed",
+          ),
+      );
+    if (incomplete.length)
+      throw new Error(
+        `Mission has incomplete managed stages: ${incomplete.map((stage) => stage.stage_id).join(", ")}`,
+      );
+
+    this.store.transitionTask(taskId, task.revision, "verifying");
+    this.store.transitionRun(runId, "verifying");
+    const verification = await runVerificationMatrix({
+      store: this.store,
+      runId,
+      taskSpec: task,
+      worktreePath: run.worktree_path,
+    });
+    this.store.sealEvidenceBundle(runId);
+    if (!verification.passed) {
+      this.store.transitionRun(runId, "failed", {
+        reason_code: "verification_failed",
+      });
+      this.store.transitionTask(taskId, task.revision, "blocked");
+      return this.store.getRun(runId);
+    }
+    this.store.transitionRun(runId, "review_ready");
+    this.store.transitionTask(taskId, task.revision, "review_ready");
+    return this.store.getRun(runId);
   }
   async cancel(runId) {
     const active = this.active.get(runId);

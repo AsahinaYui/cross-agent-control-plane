@@ -49,7 +49,8 @@ export function normalizeProfile(input, path = "profile") {
 
 export function finalizeExecutionPlan({ task, input, latestRevision = 0 }) {
   if (!task) throw new Error("ExecutionPlan requires an existing task");
-  if (!Array.isArray(input?.stages) || input.stages.length === 0)
+  const rawStages = input?.stages ?? input?.steps;
+  if (!Array.isArray(rawStages) || rawStages.length === 0)
     throw new Error("ExecutionPlan stages must not be empty");
   if (input.fallback_policy && input.fallback_policy !== "disabled")
     throw new Error("ExecutionPlan fallback_policy must be disabled");
@@ -58,7 +59,7 @@ export function finalizeExecutionPlan({ task, input, latestRevision = 0 }) {
     throw new Error(`ExecutionPlan revision must be ${latestRevision + 1}`);
   if (latestRevision > 0) requiredString(input.change_reason, "change_reason");
   const stageIds = new Set();
-  const stages = input.stages.map((stage, index) => {
+  const stages = rawStages.map((stage, index) => {
     const stageId = requiredString(
       stage?.stage_id,
       `stages[${index}].stage_id`,
@@ -66,6 +67,25 @@ export function finalizeExecutionPlan({ task, input, latestRevision = 0 }) {
     if (stageIds.has(stageId))
       throw new Error(`Duplicate ExecutionPlan stage_id: ${stageId}`);
     stageIds.add(stageId);
+    const executorKind = stage?.executor_kind ?? "managed";
+    if (!["managed", "coordinator"].includes(executorKind))
+      throw new Error(`stages[${index}].executor_kind is invalid`);
+    const dependsOn = Array.isArray(stage?.depends_on)
+      ? stage.depends_on.map((value, depIndex) =>
+          requiredString(
+            value,
+            `stages[${index}].depends_on[${depIndex}]`,
+          ),
+        )
+      : [];
+    const workspacePolicy = stage?.workspace_policy ?? "mission";
+    if (!["shared", "mission", "isolated", "auto"].includes(workspacePolicy))
+      throw new Error(`stages[${index}].workspace_policy is invalid`);
+    if (
+      stage?.timeout_seconds != null &&
+      (!Number.isFinite(stage.timeout_seconds) || stage.timeout_seconds <= 0)
+    )
+      throw new Error(`stages[${index}].timeout_seconds must be positive`);
     return {
       stage_id: stageId,
       role: requiredString(stage?.role, `stages[${index}].role`),
@@ -73,10 +93,58 @@ export function finalizeExecutionPlan({ task, input, latestRevision = 0 }) {
         stage?.responsibility ?? stage?.role,
         `stages[${index}].responsibility`,
       ),
-      profile: normalizeProfile(stage?.profile, `stages[${index}].profile`),
+      executor_kind: executorKind,
+      profile:
+        executorKind === "managed"
+          ? normalizeProfile(stage?.profile, `stages[${index}].profile`)
+          : null,
       write_intent: stage?.write_intent === true,
+      depends_on: dependsOn,
+      workspace_policy: workspacePolicy,
+      timeout_seconds: stage?.timeout_seconds ?? null,
     };
   });
+  for (const [index, stage] of stages.entries()) {
+    for (const dependency of stage.depends_on)
+      if (!stageIds.has(dependency))
+        throw new Error(
+          `stages[${index}].depends_on references unknown stage_id: ${dependency}`,
+        );
+  }
+  const visiting = new Set();
+  const visited = new Set();
+  const stageById = new Map(stages.map((stage) => [stage.stage_id, stage]));
+  const walk = (stageId) => {
+    if (visited.has(stageId)) return;
+    if (visiting.has(stageId))
+      throw new Error(`ExecutionPlan dependencies must be acyclic: ${stageId}`);
+    visiting.add(stageId);
+    const stage = stageById.get(stageId);
+    for (const dependency of stage.depends_on) walk(dependency);
+    visiting.delete(stageId);
+    visited.add(stageId);
+  };
+  for (const stage of stages) walk(stage.stage_id);
+  const concurrencyLimit = Number(input.concurrency_limit ?? 1);
+  if (!Number.isInteger(concurrencyLimit) || concurrencyLimit < 1)
+    throw new Error("concurrency_limit must be an integer >= 1");
+  const limits = {
+    max_duration_seconds:
+      input?.limits?.max_duration_seconds ??
+      input?.budget?.max_duration_seconds ??
+      null,
+    inactivity_timeout_seconds:
+      input?.limits?.inactivity_timeout_seconds ??
+      input?.budget?.inactivity_timeout_seconds ??
+      null,
+    repeated_failure_limit:
+      input?.limits?.repeated_failure_limit ??
+      input?.budget?.repeated_failure_limit ??
+      null,
+    max_tokens: input?.limits?.max_tokens ?? input?.budget?.max_tokens ?? null,
+    max_cost_usd:
+      input?.limits?.max_cost_usd ?? input?.budget?.max_cost_usd ?? null,
+  };
   const plan = {
     schema: SCHEMAS.executionPlan,
     task_id: task.task_id,
@@ -87,6 +155,9 @@ export function finalizeExecutionPlan({ task, input, latestRevision = 0 }) {
       input.coordinator_surface ?? "codex-desktop",
       "coordinator_surface",
     ),
+    concurrency_limit: concurrencyLimit,
+    workspace_policy: input.workspace_policy ?? "mission",
+    limits,
     stages,
     change_reason: input.change_reason ?? null,
     created_at: nowIso(),
@@ -136,7 +207,8 @@ export function assertSessionMatchesProfile(session, profile) {
 export function finalizeAssignment({ task, plan, stage, input, session }) {
   if (!task || !plan || !stage)
     throw new Error("Assignment requires a task, ExecutionPlan, and stage");
-  if (session) assertSessionMatchesProfile(session, stage.profile);
+  if (session && stage.executor_kind === "managed")
+    assertSessionMatchesProfile(session, stage.profile);
   return {
     schema: SCHEMAS.assignment,
     assignment_id: input.assignment_id ?? makeId("asn"),
@@ -145,9 +217,13 @@ export function finalizeAssignment({ task, plan, stage, input, session }) {
     plan_revision: plan.revision,
     stage_id: stage.stage_id,
     role: stage.role,
-    profile: structuredClone(stage.profile),
+    executor_kind: stage.executor_kind ?? "managed",
+    profile: stage.profile ? structuredClone(stage.profile) : null,
     prompt: requiredString(input.prompt ?? stage.responsibility, "prompt"),
     write_intent: input.write_intent ?? stage.write_intent,
+    depends_on: structuredClone(stage.depends_on ?? []),
+    workspace_policy: stage.workspace_policy ?? "mission",
+    timeout_seconds: stage.timeout_seconds ?? null,
     parent_assignment_id: input.parent_assignment_id ?? null,
     session_id: session?.session_id ?? null,
     run_id: null,

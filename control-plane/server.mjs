@@ -96,6 +96,22 @@ export function createControlPlaneServer({
           store.createExecutionPlan(parts[2], await body(req)),
         );
       if (
+        req.method === "POST" &&
+        parts[1] === "tasks" &&
+        parts[3] === "finalize" &&
+        parts.length === 4
+      ) {
+        const input = await body(req);
+        return json(
+          res,
+          200,
+          await orchestrator.finalizeMission({
+            taskId: parts[2],
+            runId: input.run_id,
+          }),
+        );
+      }
+      if (
         req.method === "GET" &&
         parts[1] === "tasks" &&
         parts[3] === "sessions" &&

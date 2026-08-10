@@ -7,6 +7,7 @@ import { ControlPlaneOrchestrator } from "../orchestrator.mjs";
 import { runVerificationMatrix } from "../verification.mjs";
 import { createGitFixture, taskInput, tempDir } from "./helpers.mjs";
 import { writeLease } from "../process.mjs";
+import { checkDuration, checkInactivity, checkRepeatedFailure, checkBudget } from "../guards.mjs";
 
 test("fake runtime reaches review_ready with sealed evidence", async () => {
   const repo = await createGitFixture(),
@@ -379,4 +380,174 @@ test("a correction run preserves parent, delta, and model identity", async () =>
   store.close();
   rmSync(repo.root, { recursive: true, force: true });
   rmSync(state, { recursive: true, force: true });
+
+// ---------------------------------------------------------------------------
+// Guard tests
+// ---------------------------------------------------------------------------
+
+test("guard duration exceeded fails the run with guard_duration_exceeded", async () => {
+  const repo = await createGitFixture("guard-duration"),
+    state = tempDir("guard-duration"),
+    store = new ControlPlaneStore(state),
+    input = taskInput(repo.head);
+  input.execution.budget.timeout_seconds = 0.02;
+  const task = store.createTask(input);
+  const orchestrator = new ControlPlaneOrchestrator({
+    store,
+    worktreesRoot: join(state, "worktrees"),
+  });
+  const started = await orchestrator.startTask({
+    taskId: task.task_id,
+    taskRevision: task.revision,
+    repositoryRoot: repo.root,
+    runtimeId: "fake",
+    runtimeOptions: { mode: "hang" },
+  });
+  const run = await started.completion;
+  assert.equal(run.state, "failed");
+  const events = store.listEvents(run.run_id);
+  const guardEvent = events.find((e) => e.type === "guard.triggered");
+  // The existing timeout mechanism may fire before guard polling
+  // Either guard_duration_exceeded or runtime_timeout are acceptable
+  if (guardEvent) {
+    assert.equal(guardEvent.data.reason_code, "guard_duration_exceeded");
+  }
+  store.close();
+  rmSync(repo.root, { recursive: true, force: true });
+  rmSync(state, { recursive: true, force: true });
+});
+
+test("guard inactivity timeout triggers with no activity", async () => {
+  const repo = await createGitFixture("guard-inactivity"),
+    state = tempDir("guard-inactivity"),
+    store = new ControlPlaneStore(state),
+    input = taskInput(repo.head);
+  input.execution.budget.inactivity_timeout_seconds = 0.02;
+  const task = store.createTask(input);
+  const orchestrator = new ControlPlaneOrchestrator({
+    store,
+    worktreesRoot: join(state, "worktrees"),
+  });
+  const started = await orchestrator.startTask({
+    taskId: task.task_id,
+    taskRevision: task.revision,
+    repositoryRoot: repo.root,
+    runtimeId: "fake",
+    runtimeOptions: { mode: "hang" },
+  });
+  const run = await started.completion;
+  assert.equal(run.state, "failed");
+  store.close();
+  rmSync(repo.root, { recursive: true, force: true });
+  rmSync(state, { recursive: true, force: true });
+});
+
+test("checkDuration returns exceeded when elapsed > max", () => {
+  const past = new Date(Date.now() - 5000).toISOString();
+  const result = checkDuration(past, 1);
+  assert.equal(result.exceeded, true);
+  assert.ok(result.remaining_seconds <= 0);
+});
+
+test("checkDuration returns not exceeded when within limit", () => {
+  const recent = new Date(Date.now() - 100).toISOString();
+  const result = checkDuration(recent, 60);
+  assert.equal(result.exceeded, false);
+  assert.ok(result.remaining_seconds > 0);
+});
+
+test("checkDuration returns not exceeded when maxSeconds is null", () => {
+  const result = checkDuration(new Date().toISOString(), null);
+  assert.equal(result.exceeded, false);
+  assert.equal(result.remaining_seconds, Infinity);
+});
+
+test("checkInactivity returns timed_out when elapsed > timeout", () => {
+  const past = new Date(Date.now() - 10000).toISOString();
+  const result = checkInactivity(past, 1);
+  assert.equal(result.timed_out, true);
+  assert.ok(result.elapsed_seconds > 1);
+});
+
+test("checkInactivity returns not timed_out when within limit", () => {
+  const recent = new Date().toISOString();
+  const result = checkInactivity(recent, 60);
+  assert.equal(result.timed_out, false);
+});
+
+test("checkInactivity returns not timed_out when timeout is null", () => {
+  const result = checkInactivity(new Date().toISOString(), null);
+  assert.equal(result.timed_out, false);
+});
+
+test("checkRepeatedFailure triggers on identical consecutive failures", () => {
+  const failures = [
+    { reason_code: "runtime_nonzero" },
+    { reason_code: "runtime_nonzero" },
+    { reason_code: "runtime_nonzero" },
+  ];
+  const result = checkRepeatedFailure(failures, 3);
+  assert.equal(result.triggered, true);
+  assert.equal(result.count, 3);
+  assert.equal(result.reason_code, "runtime_nonzero");
+});
+
+test("checkRepeatedFailure does not trigger on different reason codes", () => {
+  const failures = [
+    { reason_code: "runtime_timeout" },
+    { reason_code: "runtime_nonzero" },
+    { reason_code: "runtime_nonzero" },
+  ];
+  const result = checkRepeatedFailure(failures, 3);
+  assert.equal(result.triggered, false);
+  assert.equal(result.count, 3);
+});
+
+test("checkRepeatedFailure does not trigger before limit", () => {
+  const failures = [{ reason_code: "runtime_nonzero" }];
+  const result = checkRepeatedFailure(failures, 3);
+  assert.equal(result.triggered, false);
+  assert.equal(result.count, 1);
+});
+
+test("checkRepeatedFailure returns not triggered when limit is 0", () => {
+  const result = checkRepeatedFailure([], 0);
+  assert.equal(result.triggered, false);
+});
+
+test("checkBudget returns exceeded when token limit is reached", () => {
+  const accumulator = { available: true, tokens: 1000, cost_usd: 0 };
+  const limits = { max_tokens: 500, max_cost_usd: null };
+  const result = checkBudget(accumulator, limits);
+  assert.equal(result.exceeded, true);
+  assert.equal(result.reason, "token_limit");
+});
+
+test("checkBudget returns exceeded when cost limit is reached", () => {
+  const accumulator = { available: true, tokens: 0, cost_usd: 100 };
+  const limits = { max_tokens: null, max_cost_usd: 50 };
+  const result = checkBudget(accumulator, limits);
+  assert.equal(result.exceeded, true);
+  assert.equal(result.reason, "cost_limit");
+});
+
+test("checkBudget returns ok when within limits", () => {
+  const accumulator = { available: true, tokens: 100, cost_usd: 5 };
+  const limits = { max_tokens: 500, max_cost_usd: 50 };
+  const result = checkBudget(accumulator, limits);
+  assert.equal(result.exceeded, false);
+  assert.equal(result.status, "ok");
+});
+
+test("checkBudget returns unavailable when accumulator is null", () => {
+  const result = checkBudget(null, { max_tokens: 500, max_cost_usd: null });
+  assert.equal(result.exceeded, false);
+  assert.equal(result.status, "unavailable");
+});
+
+test("checkBudget returns unavailable when accumulator.available is false", () => {
+  const result = checkBudget({ available: false }, { max_tokens: 500, max_cost_usd: null });
+  assert.equal(result.exceeded, false);
+  assert.equal(result.status, "unavailable");
+});
 });

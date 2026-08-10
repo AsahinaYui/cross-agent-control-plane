@@ -663,6 +663,9 @@ export class ControlPlaneStore {
       assignment_id: input.assignment_id ?? null,
       write_intent: input.write_intent ?? null,
       input_handoff_ids: input.input_handoff_ids ?? [],
+      workflow_step_id: input.workflow_step_id ?? null,
+      workspace_policy: input.workspace_policy ?? null,
+      audit_bundle_run_id: input.audit_bundle_run_id ?? null,
       created_at: nowIso(),
     };
     atomicJson(childPath(this.runsRoot, runId, "run-context.json"), context);
@@ -716,6 +719,9 @@ export class ControlPlaneStore {
   }
   listRuns() {
     return this.db.prepare("SELECT * FROM runs ORDER BY created_at DESC").all();
+  }
+  listTaskRuns(taskId) {
+    return this.listRuns().filter((run) => run.task_id === taskId);
   }
   updateRunProcess(runId, processId, leasePath) {
     const run = this.getRun(runId);
@@ -996,7 +1002,11 @@ export class ControlPlaneStore {
     )
       throw new Error(`Invalid audit decision: ${input.decision}`);
     const run = this.getRun(input.run_id),
-      bundle = this.getBundle(input.run_id);
+      bundleRunId =
+        input.bundle_run_id ??
+        run?.context?.audit_bundle_run_id ??
+        input.run_id,
+      bundle = bundleRunId ? this.getBundle(bundleRunId) : null;
     if (!run || !bundle)
       throw new Error(
         "AuditDecision requires an existing run and sealed EvidenceBundle",
